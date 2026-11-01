@@ -20,7 +20,7 @@ python3 - "$app/Contents/Resources/ControllerBridge" <<'PYCONTROLLER'
 import pathlib,shutil,sys
 source=pathlib.Path('../controller')
 destination=pathlib.Path(sys.argv[1])
-shutil.copytree(source,destination,ignore=shutil.ignore_patterns('__pycache__','*.pyc','test_*.py','*.o','vgf-controller','test-protocol','test-auth','test-session','sunshine'))
+shutil.copytree(source,destination,ignore=shutil.ignore_patterns('__pycache__','*.pyc','test_*.py','*.o','vgf-controller','test-protocol','test-auth','test-session','test-serial','sunshine'))
 PYCONTROLLER
 cp "$bin_dir/GameCapture" "$app/Contents/MacOS/GameCapture"
 cp ../build/icons/icon.icns "$app/Contents/Resources/AppIcon.icns"

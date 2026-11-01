@@ -14,6 +14,14 @@ int vgf_usb_configured(void){
     for(char *p=udc;*p;p++)if(!isalnum((unsigned char)*p)&&*p!='.'&&*p!='-'&&*p!='_')return 0;
     snprintf(path,sizeof(path),"/sys/class/udc/%s/state",udc);return !text(path,state,sizeof(state))&&!strcmp(state,"configured");
 }
+const char *vgf_usb_state(void){
+    static char state[64],udc[128],path[256];
+    if(text("/sys/kernel/config/usb_gadget/vgf-controller/UDC",udc,sizeof(udc))||!udc[0])return "not attached";
+    for(char *p=udc;*p;p++)if(!isalnum((unsigned char)*p)&&*p!='.'&&*p!='-'&&*p!='_')return "unavailable";
+    snprintf(path,sizeof(path),"/sys/class/udc/%s/state",udc);
+    if(text(path,state,sizeof(state)))return "unavailable";
+    return state;
+}
 int vgf_usb_open(void){
     char path[64];if(text("/run/vgf-hid-device",path,sizeof(path))||strncmp(path,"/dev/hidg",9)||!path[9])return -1;
     for(char *p=path+9;*p;p++)if(!isdigit((unsigned char)*p))return -1;

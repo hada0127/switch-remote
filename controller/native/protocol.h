@@ -9,6 +9,8 @@
 #define VGF_PACKET_SIZE 56
 #define VGF_REPORT_SIZE 50
 #define VGF_QUEUE_SIZE 32
+/* Ack: uint64 sequence, "VGFA", HMAC-SHA256 of the first 12 bytes. Measurement only. */
+#define VGF_ACK_SIZE 44
 /* Wire order is shared with Swift's binaryInputPayload. */
 enum { A,B,X,Y,L,R,ZL,ZR,PLUS,MINUS,HOME,CAPTURE,LS,RS,UP,DOWN,LEFT,RIGHT };
 typedef struct { uint32_t buttons; int16_t axis[4]; } vgf_input;
@@ -27,4 +29,5 @@ void vgf_enqueue(vgf_queue *, const vgf_input *, double);
 vgf_input vgf_next(vgf_queue *, double);
 void vgf_report(vgf_protocol *, const vgf_input *, const uint8_t *, size_t, double, uint8_t out[VGF_REPORT_SIZE]);
 int vgf_decode(const uint8_t *, size_t, const uint8_t key[32], uint64_t *, vgf_input *);
+void vgf_ack(const uint8_t key[32], uint64_t, uint8_t out[VGF_ACK_SIZE]);
 #endif

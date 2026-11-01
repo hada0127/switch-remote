@@ -89,14 +89,23 @@ struct DiscoveredPi: Identifiable, Equatable {
 @MainActor final class PiDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private let browser = NetServiceBrowser()
     private let logger = Logger(subsystem: "net.tarucy.videogamefilter.native", category: "PiDiscovery")
+    private let makeResolver: (String, String, String) -> NetService
+    private let scheduleRetry: (TimeInterval, @escaping () -> Void) -> Void
     private var services: [NetService] = []
     private var devices: [String: DiscoveredPi] = [:]
     private var restartPending = false
     private var resolving = Set<String>()
+    private var resolveAttempts: [String: UUID] = [:]
     private var pendingResolve = Set<String>()
     var onChange: (([DiscoveredPi]) -> Void)?
     var onError: ((String) -> Void)?
-    override init() { super.init(); browser.delegate = self }
+    init(makeResolver: @escaping (String, String, String) -> NetService = { NetService(domain: $0, type: $1, name: $2) },
+         scheduleRetry: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, action in
+             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: action)
+         }) {
+        self.makeResolver = makeResolver; self.scheduleRetry = scheduleRetry
+        super.init(); browser.delegate = self
+    }
     func start() {
         logger.notice("Starting local Pi discovery")
         browser.schedule(in: .main, forMode: .common)
@@ -105,18 +114,39 @@ struct DiscoveredPi: Identifiable, Equatable {
     func refresh() { for service in services { resolve(service) } }
     private func resolve(_ service: NetService) {
         guard !resolving.contains(service.name), !pendingResolve.contains(service.name) else { return }
-        resolving.insert(service.name); service.resolve(withTimeout: 10)
+        let attempt = UUID()
+        resolving.insert(service.name); resolveAttempts[service.name] = attempt
+        service.resolve(withTimeout: 10)
+        // NetService can find a Bonjour service yet never call either resolve delegate method.
+        // Replace the stalled resolver so discovery recovers without restarting the app.
+        scheduleRetry(12) { [weak self, weak service] in
+            guard let self, let service, self.resolveAttempts[service.name] == attempt,
+                  self.resolving.contains(service.name),
+                  let index = self.services.firstIndex(where: { $0 === service }) else { return }
+            self.logger.error("Pi service resolution stalled; retrying")
+            self.resolving.remove(service.name)
+            self.resolveAttempts.removeValue(forKey: service.name)
+            service.delegate = nil
+            service.stop()
+            let replacement = self.makeResolver(service.domain, service.type, service.name)
+            replacement.delegate = self
+            replacement.schedule(in: .main, forMode: .common)
+            self.services[index] = replacement
+            self.resolve(replacement)
+        }
     }
     func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
         logger.notice("Found Pi service")
         if services.contains(where: { $0.name == service.name && $0.type == service.type && $0.domain == service.domain }) { return }
         // Own the resolver independently from the browser-delivered service.
-        let resolver = NetService(domain: service.domain, type: service.type, name: service.name)
-        services.append(resolver); resolver.delegate = self; resolver.schedule(in: .main, forMode: .default); resolver.schedule(in: .main, forMode: .common); resolve(resolver)
+        let resolver = makeResolver(service.domain, service.type, service.name)
+        services.append(resolver); resolver.delegate = self; resolver.schedule(in: .main, forMode: .common); resolve(resolver)
     }
     func netServiceDidResolveAddress(_ sender: NetService) {
+        guard services.contains(where: { $0 === sender }) else { return }
         logger.notice("Resolved Pi service addresses: \(sender.addresses?.count ?? 0)")
         resolving.remove(sender.name)
+        resolveAttempts.removeValue(forKey: sender.name)
         guard let txt = sender.txtRecordData(), let idData = NetService.dictionary(fromTXTRecord: txt)["id"],
               let id = String(data: idData, encoding: .utf8), UUID(uuidString: id) != nil else { return }
         var hosts: [String] = []
@@ -150,6 +180,7 @@ struct DiscoveredPi: Identifiable, Equatable {
     }
     func netServiceBrowser(_ browser: NetServiceBrowser, didRemove service: NetService, moreComing: Bool) {
         resolving.remove(service.name); pendingResolve.remove(service.name)
+        resolveAttempts.removeValue(forKey: service.name)
         services.filter { $0.name == service.name && $0.type == service.type && $0.domain == service.domain }.forEach { $0.stop() }
         devices.removeValue(forKey: service.name)
         services.removeAll { $0.name == service.name && $0.type == service.type && $0.domain == service.domain }
@@ -165,7 +196,9 @@ struct DiscoveredPi: Identifiable, Equatable {
         onError?("파이를 검색할 수 없습니다. 시스템 설정에서 로컬 네트워크 접근을 허용하세요. (\(errorDict[NetService.errorCode] ?? 0))")
     }
     func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        guard services.contains(where: { $0 === sender }) else { return }
         resolving.remove(sender.name)
+        resolveAttempts.removeValue(forKey: sender.name)
         guard services.contains(sender), pendingResolve.insert(sender.name).inserted else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak sender] in
             guard let self, let sender, self.services.contains(sender), self.pendingResolve.remove(sender.name) != nil else { return }

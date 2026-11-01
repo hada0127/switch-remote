@@ -50,7 +50,7 @@ Use **새 프리셋 저장** to save your own look. **덮어쓰기** updates a s
 
 ## Controller settings (컨트롤러)
 
-The Pi sends your Mac controller's input to the Switch. USB from the Pi to the dock is the preferred connection; Bluetooth is also supported.
+The Pi sends your Mac controller's input to the Switch. USB from the Pi to the dock is the preferred connection; Bluetooth is also supported. An optional FTDI USB serial cable carries input from the Mac to the Pi, with automatic Wi-Fi fallback; see the [Pi guide](controller/README.md).
 
 1. Use Raspberry Pi Imager to write **Raspberry Pi OS Lite, 32-bit (Bookworm or newer)** to the card. Set up the Pi's **2.4 GHz Wi-Fi**.
 2. With the card still connected to your Mac, choose **새 파이 SD 준비…** in the Controller tab and select its `bootfs` volume.

@@ -9,6 +9,7 @@ struct VideoMode: Identifiable {
     let height: Int32
     let duration: CMTime
     var fps: Double { 1 / CMTimeGetSeconds(duration) }
+    var preferenceKey: String { "\(width)x\(height)@\(Int((fps * 1000).rounded()))" }
     static func preferredDuration(minimum: CMTime, maximum: CMTime) -> CMTime {
         let target = CMTime(value: 1, timescale: 60)
         if CMTimeCompare(target, minimum) < 0 { return minimum }

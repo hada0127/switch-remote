@@ -3,6 +3,7 @@ import AVFoundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { MainActor.assumeIsolated { AgentControl.stop() } }
 }
 
 @main struct GameCaptureApp: App {
@@ -14,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var body: some Scene {
         Window("switch-remote", id: "capture") {
             CaptureView(model: capture, controller: controller, settingsTab: $settingsTab).frame(minWidth: 560, minHeight: 460)
+                .onAppear { AgentControl.start(capture: capture, controller: controller) }
         }
         .defaultSize(width: 1200, height: 800)
         .commands {

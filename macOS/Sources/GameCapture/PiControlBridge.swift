@@ -7,10 +7,12 @@ protocol ControllerSession: AnyObject {
     var onMessage: (@Sendable (String, String?) -> Void)? { get set }
     func send(_ value: ControllerInput)
     func stop()
+    func transportMetrics() -> TransportMetrics?
 }
+extension ControllerSession { func transportMetrics() -> TransportMetrics? { nil } }
 extension SSHControllerBridge: ControllerSession {}
 
-/// TLS authenticates and owns the session. Gameplay packets use UDP only.
+/// TLS authenticates and owns the session. Gameplay prefers local serial and falls back to UDP.
 final class PiControlBridge: ControllerSession, @unchecked Sendable {
     private let queue = DispatchQueue(label: "net.tarucy.controller.network", qos: .userInteractive)
     private let lock = NSLock()
@@ -18,14 +20,40 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     private var scheduled = false
     private var connection: NWConnection?
     private var udp: UDPControllerTransport?
+    private var serial: SerialControllerTransport?
+    private var serialTimer: DispatchSourceTimer?
+    private var lastSerialAttempt = 0.0
+    private var serialRetrySeconds = 1.0
+    private var latest = ControllerInput.neutral
+    private var outboundSequence: UInt64 = 0
+    private var serialLast: ControllerInput?
+    private var serialLastSent = -Double.infinity
+    private var serialDeferred: ControllerInput?
+    private var serialAxisWork: DispatchWorkItem?
     private var buffer = Data()
     private var timer: DispatchSourceTimer?
     private var active = false
     private var lastReply = ProcessInfo.processInfo.systemUptime
     private var startup = true
+    private var hidConnected = false
     private var host = ""
     private var device: PairedPi?
     var onMessage: (@Sendable (String, String?) -> Void)?
+    var onUSBState: (@Sendable (String) -> Void)?
+
+    func controlUSB(_ action: String) {
+        queue.async { [self] in
+            guard Self.canControlUSB(active: active, hasAuthenticatedTransport: udp != nil), action == "detach" || action == "attach" else { return }
+            if action == "detach" {
+                lock.lock(); pending.append(.neutral, at: ProcessInfo.processInfo.systemUptime); lock.unlock()
+                flush()
+            }
+            write(["type": "usb", "action": action])
+        }
+    }
+    static func canControlUSB(active: Bool, hasAuthenticatedTransport: Bool) -> Bool {
+        active && hasAuthenticatedTransport
+    }
 
     func send(_ value: ControllerInput) {
         lock.lock()
@@ -77,6 +105,10 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                 if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) { self.fail("파이 응답이 없어 다시 연결합니다.") }
             }
             self.timer = timer; timer.resume()
+            let probe = DispatchSource.makeTimerSource(queue: queue)
+            probe.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20))
+            probe.setEventHandler { [weak self] in self?.checkSerial() }
+            serialTimer = probe; probe.resume()
             connection.start(queue: queue)
         }
     }
@@ -116,23 +148,124 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                 guard udp == nil, let version = message["version"] as? Int, (1...2).contains(version),
                       let port = message["port"] as? Int, let encoded = message["key"] as? String,
                       let key = Data(base64Encoded: encoded) else { fail("UDP 연결 정보 오류"); return }
-                do { udp = try UDPControllerTransport(host: host, port: port, key: key, version: version); flush() }
+                do { udp = try UDPControllerTransport(host: host, port: port, key: key, version: version, queue: queue); checkSerial(); flush() }
                 catch { fail(error.localizedDescription); return }
             case "status":
                 guard let state = message["state"] as? String else { continue }
+                if let usbState = message["usbState"] as? String { onUSBState?(usbState) }
                 startup = state == "starting" || state == "waiting"
+                if state == "connected" && !hidConnected {
+                    serialRetrySeconds = 1; lastSerialAttempt = 0
+                    checkSerial()
+                }
+                hidConnected = state == "connected"
                 onMessage?(state, message["backend"] as? String)
             case "error": fail(message["message"] as? String ?? "파이 연결 오류"); return
             default: fail("지원하지 않는 파이 응답입니다."); return
             }
         }
     }
+    static func serialHealthy(openedAt: Double, lastAck: Double, now: Double) -> Bool {
+        lastAck > 0 && now - lastAck < 0.1 && lastAck >= openedAt
+    }
+    private func nextSequence() -> UInt64 {
+        outboundSequence += 1
+        return outboundSequence
+    }
+    private func dropSerial() {
+        serial = nil
+        serialAxisWork?.cancel(); serialAxisWork = nil
+        serialDeferred = nil; serialLast = nil
+    }
+    private func checkSerial() {
+        guard active, let udp else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let serial {
+            if now - serial.openedAt > 0.15 && !Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: now) {
+                serialRetrySeconds = serial.lastAck == 0 ? min(hidConnected ? 2 : 30, serialRetrySeconds * 2) : 1
+                lastSerialAttempt = now
+                dropSerial()
+                // Repair any held input immediately after losing the cable.
+                try? udp.send(latest, sequence: nextSequence())
+            }
+            if Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: now) { serialRetrySeconds = 1 }
+            return
+        }
+        guard now - lastSerialAttempt >= serialRetrySeconds else { return }
+        lastSerialAttempt = now
+        guard let path = SerialControllerTransport.devicePath() else { return }
+        do {
+            serial = try SerialControllerTransport(path: path, queue: queue) { [weak self] in
+                guard let self, self.active else { return }
+                self.serialRetrySeconds = self.serial?.lastAck == 0 ? min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2) : 1
+                self.lastSerialAttempt = ProcessInfo.processInfo.systemUptime
+                self.dropSerial()
+                if let udp = self.udp { try? udp.send(self.latest, sequence: self.nextSequence()) }
+            }
+            try serial?.send(latest, sequence: nextSequence())
+            serialLast = latest; serialLastSent = now
+        } catch { serialRetrySeconds = min(hidConnected ? 2 : 30, serialRetrySeconds * 2); lastSerialAttempt = now; dropSerial() }
+    }
+    /// At 115200, a 29-byte state takes about 2.5 ms. Merge analog-only
+    /// bursts into a 4 ms interval; button transitions still go immediately.
+    private func sendSerial(_ value: ControllerInput, sequence: UInt64? = nil) throws -> Bool {
+        guard let serial else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        if serialLast?.buttons == value.buttons && now - serialLastSent < 0.004 {
+            if sequence != nil {
+                serialAxisWork?.cancel(); serialAxisWork = nil; serialDeferred = nil
+                return false
+            }
+            serialDeferred = value
+            if serialAxisWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.serialAxisWork = nil
+                    guard let value = self.serialDeferred, let serial = self.serial else { return }
+                    self.serialDeferred = nil
+                    do {
+                        try serial.send(value, sequence: self.nextSequence())
+                        self.serialLast = value; self.serialLastSent = ProcessInfo.processInfo.systemUptime
+                    } catch {
+                        self.serialRetrySeconds = min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2)
+                        self.lastSerialAttempt = ProcessInfo.processInfo.systemUptime
+                        self.dropSerial()
+                        if let udp = self.udp { try? udp.send(self.latest, sequence: self.nextSequence()) }
+                    }
+                }
+                serialAxisWork = work
+                queue.asyncAfter(deadline: .now() + (serialLastSent + 0.004 - now), execute: work)
+            }
+            return false
+        }
+        serialAxisWork?.cancel(); serialAxisWork = nil; serialDeferred = nil
+        try serial.send(value, sequence: sequence ?? nextSequence())
+        serialLast = value; serialLastSent = now
+        return true
+    }
     private func flush() {
         guard active, let udp else { return }
         lock.lock(); let values = pending.drain(at: ProcessInfo.processInfo.systemUptime); lock.unlock()
         for value in values {
             guard active else { break }
-            do { try udp.send(value) } catch { fail(error.localizedDescription) }
+            latest = value
+            let now = ProcessInfo.processInfo.systemUptime
+            let healthy = serial.map { Self.serialHealthy(openedAt: $0.openedAt, lastAck: $0.lastAck, now: now) } ?? false
+            let shared = nextSequence()
+            if serial != nil {
+                do {
+                    let sent = try sendSerial(value, sequence: healthy ? nil : shared)
+                    if healthy { continue }
+                    // When serial sends immediately, both paths share the same
+                    // sequence so late UDP cannot replay an older state.
+                    _ = sent
+                } catch {
+                    serialRetrySeconds = min(hidConnected ? 2 : 30, serialRetrySeconds * 2)
+                    lastSerialAttempt = ProcessInfo.processInfo.systemUptime
+                    dropSerial()
+                }
+            }
+            do { try udp.send(value, sequence: shared) } catch { fail(error.localizedDescription) }
         }
     }
     private func fail(_ message: String) {
@@ -140,13 +273,24 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         onMessage?("error", message); finish()
     }
     private func finish() {
-        active = false
-        try? udp?.send(ControllerInput.neutral)
-        udp = nil; timer?.cancel(); timer = nil
+        active = false; hidConnected = false
+        let neutralSequence = nextSequence()
+        try? serial?.send(.neutral, sequence: neutralSequence)
+        try? udp?.send(ControllerInput.neutral, sequence: neutralSequence)
+        udp = nil; dropSerial(); serialTimer?.cancel(); serialTimer = nil; timer?.cancel(); timer = nil
         connection?.stateUpdateHandler = nil; connection?.cancel(); connection = nil
         buffer = Data()
     }
     func stop() { queue.async { [self] in finish() } }
+    /// Never call from `queue`.
+    func transportMetrics() -> TransportMetrics? {
+        queue.sync {
+            guard active else { return nil }
+            if let serial, Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: ProcessInfo.processInfo.systemUptime) { return serial.metrics }
+            if let udp { return udp.metrics }
+            return connection == nil ? nil : TransportMetrics(kind: "tls", rtt: nil)
+        }
+    }
 }
 
 /// Preserve button edges during a burst; only redundant axis/heartbeat states coalesce.

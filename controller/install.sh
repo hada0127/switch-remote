@@ -7,11 +7,11 @@ if [ "$(id -u)" != 0 ]; then
     exit 1
 fi
 apt-get update
-apt-get install -y bluez avahi-daemon iw build-essential pkg-config libssl-dev libjson-c-dev libdbus-1-dev libbluetooth-dev
+apt-get install -y bluez avahi-daemon iw util-linux build-essential pkg-config libssl-dev libjson-c-dev libdbus-1-dev libbluetooth-dev
 install -d -m 755 /opt/videogamefilter-controller
 make -C native clean all check
 install -d -m 755 /opt/videogamefilter-controller/native
-install -m 755 native/vgf-controller native/usb-gadget.sh /opt/videogamefilter-controller/native/
+install -m 755 native/vgf-controller native/usb-gadget.sh native/usb-control.sh native/usb-watch.sh /opt/videogamefilter-controller/native/
 install -m 644 native/switch-controller.xml /opt/videogamefilter-controller/native/
 install -m 644 vendor/NXBT-LICENSE /opt/videogamefilter-controller/native/
 chown -R root:root /opt/videogamefilter-controller
@@ -51,6 +51,40 @@ BLUEZ
         cp -n "$config" "$config.vgf-backup" || true
         printf '\n[all]\n# Video Game Filter USB controller\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$config"
     fi
+    # Keep the gadget overlay in the serial rollback backup.
+    if [ -f "$config" ] && { ! grep -q '^enable_uart=1$' "$config" || ! grep -q '^core_freq=250$' "$config"; }; then
+        cp -n "$config" "$config.vgf-serial-backup" || true
+    fi
+    # Stable mini UART clock keeps 115200 reliable while Bluetooth retains PL011.
+    if [ -f "$config" ]; then
+        if ! grep -q '^enable_uart=1$' "$config"; then printf '\n[all]\nenable_uart=1\n' >> "$config"; fi
+        if ! grep -q '^core_freq=250$' "$config"; then printf '\n[all]\ncore_freq=250\n' >> "$config"; fi
+    fi
+    cmdline=/boot/firmware/cmdline.txt
+    if [ -f "$cmdline" ]; then
+        cp -n "$cmdline" "$cmdline.vgf-serial-backup" || true
+        python3 - <<'SERIAL_CMDLINE'
+from pathlib import Path
+import os, tempfile
+path = Path('/boot/firmware/cmdline.txt')
+original = path.read_text()
+words = original.split()
+updated = ' '.join(w for w in words if not w.startswith('console=serial0,')) + '\n'
+if updated != original:
+    fd, temporary = tempfile.mkstemp(prefix='cmdline.vgf-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as output:
+            output.write(updated)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, path.stat().st_mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+SERIAL_CMDLINE
+    fi
+    systemctl disable --now serial-getty@ttyS0.service 2>/dev/null || true
+    systemctl mask serial-getty@ttyS0.service 2>/dev/null || true
     cat > /etc/systemd/system/vgf-usb-gadget.service <<'GADGET'
 [Unit]
 Description=Video Game Filter USB controller gadget
@@ -63,6 +97,19 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 GADGET
+    cat > /etc/systemd/system/vgf-usb-watch.service <<'WATCH'
+[Unit]
+Description=Video Game Filter USB gadget reattach watchdog
+Requires=vgf-usb-gadget.service
+After=vgf-usb-gadget.service
+[Service]
+Type=simple
+ExecStart=/opt/videogamefilter-controller/native/usb-watch.sh
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+WATCH
     cat > /etc/systemd/system/vgf-controller.service <<'UNIT'
 [Unit]
 Description=Video Game Filter controller service
@@ -72,6 +119,8 @@ After=network-online.target bluetooth.service avahi-daemon.service vgf-usb-gadge
 Type=simple
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
 ExecStartPre=-/usr/sbin/iw dev wlan0 set power_save off
+# ondemand ramps up only after load; input bursts are too short for that.
+ExecStartPre=-/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$$g" ] && echo performance > "$$g"; done; true'
 ExecStart=/opt/videogamefilter-controller/native/vgf-controller
 Nice=-5
 Restart=on-failure
@@ -85,6 +134,8 @@ UNIT
     systemctl daemon-reload
     systemctl restart bluetooth.service
     systemctl enable --now vgf-usb-gadget.service
+    systemctl enable vgf-usb-watch.service
+    systemctl restart vgf-usb-watch.service
     systemctl enable --now avahi-daemon.service
     systemctl enable vgf-controller.service
     systemctl restart vgf-controller.service

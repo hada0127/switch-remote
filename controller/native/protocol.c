@@ -31,6 +31,11 @@ int vgf_decode(const uint8_t *p,size_t n,const uint8_t key[32],uint64_t *last,vg
     for(int i=0;i<4;i++){uint16_t u=p[16+i*2]|((uint16_t)p[17+i*2]<<8);v.axis[i]=u<=32767?(int16_t)u:(int16_t)((int32_t)u-65536);}
     *out=v;*last=seq;return 0;
 }
+void vgf_ack(const uint8_t key[32],uint64_t seq,uint8_t out[VGF_ACK_SIZE]) {
+    for(int i=7;i>=0;i--){out[i]=(uint8_t)seq;seq>>=8;}
+    memcpy(out+8,"VGFA",4);unsigned int len=0;
+    if(!HMAC(EVP_sha256(),key,32,out,12,out+12,&len)||len!=32)memset(out+12,0,32);
+}
 static void stick(uint8_t *out,int16_t x,int16_t y,int cx,int cy,int negx,int posx,int negy,int posy) {
     int xx=cx+(int)lround((double)x*(x<0?negx:posx)/(x<0?32768:32767));
     int yy=cy+(int)lround((double)y*(y<0?negy:posy)/(y<0?32768:32767));

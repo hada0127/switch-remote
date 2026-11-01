@@ -1,6 +1,6 @@
 # Raspberry Pi controller bridge
 
-switch-remote discovers a Raspberry Pi Zero W on the local network and automatically connects to a Pi prepared by this Mac. No Pi display, PIN entry, SSH login or IP address is needed during normal use. Game input uses authenticated UDP without acknowledgments; TLS manages enrollment and connection lifetime.
+switch-remote discovers a Raspberry Pi Zero W on the local network and automatically connects to a Pi prepared by this Mac. No Pi display, PIN entry, SSH login or IP address is needed during normal use. Game input prefers a wired FTDI USB-to-GPIO serial cable when available and falls back to authenticated UDP over Wi-Fi. TLS manages enrollment and connection lifetime.
 
 ## Prepare a new SD card
 
@@ -12,13 +12,29 @@ switch-remote discovers a Raspberry Pi Zero W on the local network and automatic
 
 Open **Controllers → Change Grip/Order** on the Switch for its first pairing with the Pi. The physical gamepad pairs with the Mac; the Pi pairs with the Switch. Both may advertise as “Pro Controller”, so do not pair the Pi with the Mac in Bluetooth settings.
 
+## Wired Mac-to-Pi input
+
+Use a 3.3 V FTDI FT232R USB UART cable: Mac USB → Pi GPIO pins 6 GND, 8 GPIO14 TXD, and 10 GPIO15 RXD. Cross the signal directions (cable RX to pin 8, cable TX to pin 10). Leave cable VCC disconnected. The Pi's USB data port still goes to the Switch dock for HID output. Keep Wi-Fi configured for discovery, enrollment, and the TLS control session; pad data uses the cable once serial acknowledgments arrive.
+
+The app detects FTDI VID `0403`/PID `6001` devices with `/dev/cu.usbserial-*` names, opens 115200 8N1 raw, and reports `serial` or `udp-v2` in `switchctl status` under `controller.transport`. Set `SWITCH_REMOTE_DISABLE_SERIAL=1` when launching the app to force UDP for testing or rollback. `SWITCH_REMOTE_SERIAL_PATH=/dev/cu.usbserial-...` selects a specific FTDI port. A disconnected or unresponsive serial link falls back to UDP and retries the cable. The Pi logs `serial input ready` and a `session end` line with `serial_input` and `serial_invalid` counters. Serial round-trip timing appears in `controller.metrics.rtt` when acknowledgments have arrived.
+
+Frames are `a5 5a`, one-byte length, eight-byte big-endian sequence, the 16-byte `VGF2` state, and little-endian CRC-16/CCITT-FALSE. Input length is 24; acknowledgment length is 8 and carries the sequence. The CRC covers length through payload. Button changes go immediately; analog-only bursts are merged to at most 250 Hz so a 115200 link cannot build a backlog. The 20 ms full-state heartbeat follows the same path as UDP. The Pi shares its 350 ms neutral release and 10 s session timeout across both inputs. TLS enrollment still gates the session; serial itself relies on physical access to the dedicated cable and is not independently authenticated.
+
+The GPIO mini UART uses a fixed 250 MHz core clock to keep 115200 stable. This leaves the PL011 UART attached to Bluetooth, preserving Bluetooth as a fallback for Pi-to-Switch output. Installation backs up `/boot/firmware/config.txt` as `config.txt.vgf-serial-backup` if it changes it, and `/boot/firmware/cmdline.txt` as `cmdline.txt.vgf-serial-backup`; it removes the serial login console and masks `serial-getty@ttyS0.service`. Reboot once after installing. To roll back Pi serial setup, stop `vgf-controller.service`, restore `cmdline.txt.vgf-serial-backup`, and restore `config.txt.vgf-serial-backup` if it exists. On an SD card prepared with the app, there may be no serial config backup because UART was enabled before first boot; remove the added `enable_uart=1` and `core_freq=250` lines while retaining `dtoverlay=dwc2,dr_mode=peripheral`. The saved cmdline backup excludes Imager's one-time boot command. Unmask and enable `serial-getty@ttyS0.service`, then reboot and restart the controller service. Keep any older board configuration backups available until the wired path is verified.
+
 ## Operation
 
-The app sends changed button state immediately, limits analog updates to approximately 125 Hz, and sends a full-state heartbeat every 20 ms. Only the active app forwards physical input. Selecting no gamepad or switching apps sends neutral state. A Pi releases inputs after 350 ms without a valid datagram; after 10 seconds without input it closes that session. Closing the control connection also requests neutral state.
+`vgf-usb-watch.service` polls the Pi USB gadget state once per second. If it remains unconfigured for 12 seconds, the watchdog disconnects and rebinds the gadget, then retries with backoff up to 120 seconds. It logs state changes in the journal and leaves a configured gadget alone. This covers a Pi boot before the dock is ready and undock/redock while the Pi has separate power. A Bluetooth session returns to USB after the gadget configures.
 
-Bluetooth pairing reports are limited to 15 Hz until initialization completes. Afterwards idle reports use 15 ms intervals; changed input can advance the next report (4 ms minimum). USB uses an 8 ms heartbeat and a 1 ms minimum for changed input. A blocked Bluetooth HID output lasting 100 ms ends the session. USB waits for the host to resume polling, while keeping the existing stale-input and disconnect timeouts. On session cleanup, USB retries a blocked neutral report after up to two 20 ms waits; a host that remains unresponsive may not receive that release.
+The Controller tab's **USB 연결 해제** and **USB 다시 연결** buttons release inputs and detach, or reattach, the Pi USB gadget over the authenticated control session. `switchctl controller disconnect|reconnect` and MCP `switch_controller_disconnect|switch_controller_reconnect` do the same. `switchctl status` reports `controller.usbState`. A manual detach pauses the watchdog until reattach; rebooting the Pi clears that pause. Command success means the request was queued; check status for the resulting USB state.
 
-Each connection creates an ephemeral UDP port and random HMAC key, delivered over pinned TLS. Datagrams contain an increasing sequence number, full input state, and SHA-256 HMAC. Out-of-order, duplicate, unauthenticated and oversized datagrams are discarded. UDP packets are authenticated but not encrypted. No input acknowledgment or retransmission is required. Allow the app's local network access, TCP 24872 and UDP traffic to the Pi, and mDNS discovery on the LAN.
+Selecting **입력 사용 안 함** (None) releases inputs and detaches the USB gadget. Selecting a gamepad or Moonlight again reattaches it, including after a manual USB disconnect; a saved real source also reattaches on app launch. A gamepad temporarily disappearing does not detach USB. `switchctl source none|gamepad|moonlight` and MCP `switch_source` select the same source; `gamepad` remains selected as a preference even if the saved pad is offline. With USB detached and no Bluetooth link, agent input returns `not_connected` until the Switch link is live. The Pi watchdog remains paused after the detach until an attach request.
+
+The app sends button changes immediately. The first analog change after 2 ms without a change-driven send also goes immediately; further analog-only changes within 2 ms are merged into one send of the latest state at the 2 ms boundary (at most 500 Hz). A full-state heartbeat follows every 20 ms and does not delay analog changes. Only the active app forwards physical input. Selecting no gamepad or switching apps sends neutral state. A Pi releases inputs after 350 ms without a valid datagram; after 10 seconds without input it closes that session. Closing the control connection also requests neutral state.
+
+Bluetooth pairing reports are limited to 15 Hz until initialization completes. Afterwards idle reports use 15 ms intervals; changed input can advance the next report (4 ms minimum). USB uses an 8 ms heartbeat and a 1 ms minimum for changed input. A blocked Bluetooth HID output lasting 100 ms ends the session. USB waits for the host to resume polling, while keeping the existing stale-input and disconnect timeouts. On session cleanup, USB retries a blocked neutral report after up to two 20 ms waits; a host that remains unresponsive may not receive that release. While a USB session is active the Pi soft-blocks its Bluetooth radio so Wi-Fi does not share airtime with Bluetooth coexistence; it unblocks Bluetooth before any Bluetooth session. The service runs with `Nice=-5` and sets the CPU governor to `performance` at start. Each `session end` journal line also reports the largest UDP inter-arrival gap and the number of gaps over 40 ms.
+
+Each connection creates an ephemeral UDP port and random HMAC key, delivered over pinned TLS. Datagrams contain an increasing sequence number, full input state, and SHA-256 HMAC. Out-of-order, duplicate, unauthenticated and oversized datagrams are discarded. UDP packets are authenticated but not encrypted. Nothing is retransmitted. Once every received input has been written to the HID report, the Pi sends at most one 44-byte authenticated acknowledgment (sequence, `VGFA`, HMAC) per loop for the newest accepted datagram, used only for the app's round-trip log (`Input RTT` p50/p99/max every 5 s); earlier datagrams in the same batch are not acknowledged. apps that ignore it and Pis that do not send it remain compatible. Allow the app's local network access, TCP 24872 and UDP traffic to the Pi, and mDNS discovery on the LAN.
 
 The initial certificate fingerprint is transferred during SD preparation, not trusted from an unauthenticated network advertisement. PINs and persistent client credentials are stored in macOS Keychain. The Pi keeps its credentials in a root-only directory. Registration permits one Mac, rate-limits incorrect PIN attempts, and invalidates the PIN after the Mac has saved its permanent key. An interrupted enrollment can resume without losing access. The current version does not transfer registration to another Mac automatically; prepare a new card or retain/import the provisioning receipt using the development tools.
 
@@ -36,7 +52,7 @@ On the Pi, run `make -C controller/native check` for native protocol/enrollment 
 
 파이에 HDMI를 연결하거나 앱에서 PIN·SSH 주소를 입력할 필요가 없습니다. Raspberry Pi Imager에서 **Bookworm/Trixie 이상 32비트 Lite OS와 2.4GHz Wi-Fi**를 설정해 SD를 구운 뒤, 앱의 **새 파이 SD 준비…**에서 `bootfs`를 선택하세요. 앱이 임시 PIN과 인증 정보를 만들고 맥에 기억합니다. SD를 파이에 넣고 켜면 최초 설치 후 네트워크에서 자동으로 찾아 등록하며, 이후에는 키체인에 저장된 연결 키로 자동 재연결합니다.
 
-최초 설치에는 인터넷이 필요하고 몇 분 걸릴 수 있습니다. 맥에서 로컬 네트워크 접근 권한을 허용해주세요. 스위치와 처음 페어링할 때만 **컨트롤러 → 잡는 방법/순서 변경** 화면을 열면 됩니다. 버튼 입력은 UDP로 즉시 전달하며, 입력이 끊기면 자동으로 버튼을 놓습니다. 스위치 2 슬립 깨우기·진동·자이로는 지원하지 않습니다.
+최초 설치에는 인터넷이 필요하고 몇 분 걸릴 수 있습니다. 맥에서 로컬 네트워크 접근 권한을 허용해주세요. 스위치와 처음 페어링할 때만 **컨트롤러 → 잡는 방법/순서 변경** 화면을 열면 됩니다. 버튼 입력은 연결된 UART 케이블을 우선 사용하고 케이블이 없으면 UDP로 전달하며, 입력이 끊기면 자동으로 버튼을 놓습니다. 스위치 2 슬립 깨우기·진동·자이로는 지원하지 않습니다.
 
 ## Moonlight on iPhone (development)
 
@@ -93,7 +109,10 @@ remain compatible with the earlier service.
 
 Use the **Basic / 기본**, **Retro effects / 레트로 효과**, and **Controller / 컨트롤러** tabs.
 HOME, Capture, L+R, and Close stay visible above every tab. A physical controller's Home/Guide signal received from Moonlight is
-forwarded as Switch HOME. There is no START+SELECT remapping; PLUS and MINUS stay independent.
+forwarded as Switch HOME. When a local gamepad is selected, the app takes over its Home/Guide and
+Xbox Share, Menu (+), and Options (-) buttons from macOS system gestures, forwarding them as
+Switch HOME, Capture, +, and -. The app restores system gestures when it loses focus, that
+gamepad is deselected, or the app quits. There is no START+SELECT remapping.
 
 For USB, connect the Zero W's **USB data port** (not PWR IN) to a Switch dock USB port
 using a data cable. If the console does not accept wired input, check **Settings →

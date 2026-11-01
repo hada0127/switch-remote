@@ -3,6 +3,10 @@ import AVFoundation
 
 @MainActor final class CaptureModel: ObservableObject {
     let engine = CaptureEngine()
+    /// Newest raw frame for agent snapshots; filled on the capture frame queue.
+    let frameTap = FrameTap()
+    /// Last measured capture size and rate, for agent status.
+    private(set) var frameInfo: (width: Int, height: Int, fps: Double)?
     let renderer: VideoRenderer?
     @Published var rendererError: String?
     @Published var videos: [AVCaptureDevice] = []
@@ -16,26 +20,39 @@ import AVFoundation
     @Published var hasFrames = false
     @Published var status = "캡처카드를 선택하세요"
     @Published var measured = ""
-    @Published var volume: Double = 0.7 { didSet { engine.volume(muted ? 0 : Float(volume)) } }
-    @Published var muted = false { didSet { engine.volume(muted ? 0 : Float(volume)) } }
+    @Published var volume: Double = 0.7 { didSet { defaults.set(volume, forKey: "capture.volume"); engine.volume(muted ? 0 : Float(volume)) } }
+    @Published var muted = false { didSet { defaults.set(muted, forKey: "capture.muted"); engine.volume(muted ? 0 : Float(volume)) } }
     @Published var controlsVisible = true
     private var observers: [NSObjectProtocol] = []
     private var generation = 0
     private var lastFrame = Date.distantPast
     private var timer: Timer?
+    private let defaults: UserDefaults
+    private var preferredVideo = ""
+    private var preferredAudio = ""
+    private var hasAudioPreference = false
+    private var preferredMode = ""
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        preferredVideo = defaults.string(forKey: "capture.videoID") ?? ""
+        preferredAudio = defaults.string(forKey: "capture.audioID") ?? ""
+        hasAudioPreference = defaults.object(forKey: "capture.audioID") != nil
+        preferredMode = defaults.string(forKey: "capture.mode") ?? ""
+        if let saved = defaults.object(forKey: "capture.volume") as? Double { volume = min(1, max(0, saved.isFinite ? saved : 0.7)) }
+        muted = defaults.object(forKey: "capture.muted") as? Bool ?? false
         do { renderer = try VideoRenderer() }
         catch { renderer = nil; rendererError = error.localizedDescription }
         renderer?.onError = { [weak self] message in
             DispatchQueue.main.async { self?.rendererError = message }
         }
-        engine.onVideoFrame = { [renderer] frame in renderer?.submit(frame) }
+        engine.onVideoFrame = { [renderer, frameTap] frame in frameTap.store(frame); renderer?.submit(frame) }
         engine.onFrames = { [weak self] width, height, rate in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.lastFrame = Date()
                 self.hasFrames = true
+                self.frameInfo = (Int(width), Int(height), rate)
                 self.measured = "캡처 \(width) × \(height) · \(String(format: "%.1f", rate)) fps"
             }
         }
@@ -70,33 +87,50 @@ import AVFoundation
             audioID = ""
             if running { stop(message: "오디오 장치 연결이 해제됐습니다. 소리 없이 다시 시작할 수 있습니다.") }
         }
-        if videoID.isEmpty, let device = videos.first(where: { $0.localizedName.localizedCaseInsensitiveContains("HD60") }) ?? videos.first {
+        if videoID.isEmpty, let device = videos.first(where: { $0.uniqueID == preferredVideo }) ?? videos.first(where: { $0.localizedName.localizedCaseInsensitiveContains("HD60") }) ?? videos.first {
             videoID = device.uniqueID
             selectVideo()
         }
+        if !busy && !preferredVideo.isEmpty && videoID != preferredVideo,
+           videos.contains(where: { $0.uniqueID == preferredVideo }) {
+            videoID = preferredVideo
+            selectVideo()
+            if running { stop(restart: true) }
+        }
+        if Self.shouldRestoreAudio(running: running, busy: busy, current: audioID, preferred: preferredAudio,
+                                   available: audios.contains(where: { $0.uniqueID == preferredAudio })) { audioID = preferredAudio }
+    }
+    static func shouldRestoreAudio(running: Bool, busy: Bool, current: String, preferred: String, available: Bool) -> Bool {
+        !running && !busy && available && !preferred.isEmpty && current != preferred
     }
     func selectVideo() {
         guard let device = videos.first(where: { $0.uniqueID == videoID }) else { modes = []; modeID = -1; return }
         modes = CaptureEngine.modes(for: device)
         // Prefer smooth 1080p for play; every supported resolution remains selectable.
-        modeID = VideoMode.preferred(in: modes)?.id ?? -1
-        if let matching = audios.first(where: { $0.uniqueID == device.uniqueID || $0.localizedName == device.localizedName }) { audioID = matching.uniqueID }
+        modeID = modes.first(where: { $0.preferenceKey == preferredMode })?.id ?? VideoMode.preferred(in: modes)?.id ?? -1
+        if hasAudioPreference && preferredAudio.isEmpty { audioID = "" }
+        else if let saved = audios.first(where: { $0.uniqueID == preferredAudio }) { audioID = saved.uniqueID }
+        else if let matching = audios.first(where: { $0.uniqueID == device.uniqueID || $0.localizedName == device.localizedName }) { audioID = matching.uniqueID }
         else { audioID = "" }
     }
     func changeVideo(to id: String) {
         guard !busy else { return }
         videoID = id
+        preferredVideo = id; defaults.set(id, forKey: "capture.videoID")
         selectVideo()
         running ? stop(restart: true) : start()
     }
     func changeAudio(to id: String) {
         guard !busy else { return }
         audioID = id
+        preferredAudio = id; defaults.set(id, forKey: "capture.audioID")
+        hasAudioPreference = true
         running ? stop(restart: true) : start()
     }
     func changeMode(to id: Int) {
         guard !busy else { return }
         modeID = id
+        if let mode = modes.first(where: { $0.id == id }) { preferredMode = mode.preferenceKey; defaults.set(preferredMode, forKey: "capture.mode") }
         running ? stop(restart: true) : start()
     }
     func start() {
@@ -118,7 +152,7 @@ import AVFoundation
                 guard let self, request == self.generation else { return }
                 self.busy = false
                 switch result {
-                case .success: if self.renderer != nil { self.rendererError = nil }; self.running = true; self.lastFrame = Date(); self.status = "프레임 대기 중…"
+                case .success: if self.renderer != nil { self.rendererError = nil }; self.running = true; self.lastFrame = Date(); self.status = "프레임 대기 중…"; self.refresh()
                 case .failure(let error): self.running = false; self.hasFrames = false; self.status = error.localizedDescription
                 }
             }
@@ -134,10 +168,14 @@ import AVFoundation
     func stop(message: String = "캡처가 중지됐습니다", restart: Bool = false) {
         generation += 1
         let request = generation
-        running = false; hasFrames = false; measured = ""; busy = true
+        running = false; hasFrames = false; measured = ""; busy = true; frameInfo = nil
+        frameTap.clear()
         engine.stop { [weak self] in
+            // Frames queued before the session stopped may have refilled the tap.
+            self?.frameTap.clear()
             guard let self, self.generation == request else { return }
             self.busy = false; self.status = message
+            if self.audios.contains(where: { $0.uniqueID == self.preferredAudio }) { self.audioID = self.preferredAudio }
             if restart { self.start() }
         }
     }

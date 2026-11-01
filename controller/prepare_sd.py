@@ -36,7 +36,7 @@ def prepare(destination, stage=False, receipt_path=None, before_commit=None):
     pin = f'{secrets.randbelow(1000000):06d}'
     with tempfile.TemporaryDirectory(prefix='vgf-provision-') as temporary:
         payload = Path(temporary) / 'payload'; payload.mkdir()
-        shutil.copytree(source / 'native', payload / 'native', ignore=shutil.ignore_patterns('*.o', 'vgf-controller', 'test-protocol', 'test-auth', 'test-session'))
+        shutil.copytree(source / 'native', payload / 'native', ignore=shutil.ignore_patterns('*.o', 'vgf-controller', 'test-protocol', 'test-auth', 'test-session', 'test-serial'))
         for name in ['install.sh', 'install_identity.py']:
             shutil.copy2(source / name, payload / name)
         shutil.copytree(source / 'vendor', payload / 'vendor', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
@@ -51,7 +51,7 @@ def prepare(destination, stage=False, receipt_path=None, before_commit=None):
         for p in config.iterdir(): p.chmod(0o600)
         receipt = {'id': device_id, 'name': 'Video Game Filter Pi', 'fingerprint': hashlib.sha256(der).hexdigest(),
                    'client': str(uuid.uuid4()), 'pin': pin}
-        names = ['vgf-controller', 'vgf-firstboot.sh', 'vgf-previous-run.txt', 'vgf-cmdline-original.txt']
+        names = ['vgf-controller', 'vgf-firstboot.sh', 'vgf-previous-run.txt', 'vgf-cmdline-original.txt', 'cmdline.txt.vgf-serial-backup']
         if any((destination / name).exists() for name in names):
             raise ValueError('기존 준비 파일이 있습니다.')
         receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -64,10 +64,16 @@ def prepare(destination, stage=False, receipt_path=None, before_commit=None):
                 shutil.copy2(source / 'firstboot.sh', destination / 'vgf-firstboot.sh')
                 if previous: (destination / 'vgf-previous-run.txt').write_text(previous[0])
                 (destination / 'vgf-cmdline-original.txt').write_text(original)
-                updated = [v for v in arguments if not v.startswith(('systemd.run=', 'systemd.run_success_action=', 'systemd.unit='))]
+                rollback_words = [v for v in arguments if not v.startswith(('systemd.run=', 'systemd.run_success_action=', 'systemd.unit='))]
+                (destination / 'cmdline.txt.vgf-serial-backup').write_text(' '.join(rollback_words) + '\n')
+                updated = [v for v in arguments if not v.startswith(('systemd.run=', 'systemd.run_success_action=', 'systemd.unit=', 'console=serial0,'))]
                 updated += ['systemd.run=/boot/firmware/vgf-firstboot.sh', 'systemd.run_success_action=reboot', 'systemd.unit=kernel-command-line.target']
+                settings = []
                 if 'dtoverlay=dwc2,dr_mode=peripheral' not in original_config.splitlines():
-                    config_path.write_text(original_config + '\n[all]\n# Video Game Filter USB controller\ndtoverlay=dwc2,dr_mode=peripheral\n')
+                    settings.append('dtoverlay=dwc2,dr_mode=peripheral')
+                if 'enable_uart=1' not in original_config.splitlines(): settings.append('enable_uart=1')
+                if 'core_freq=250' not in original_config.splitlines(): settings.append('core_freq=250')
+                if settings: config_path.write_text(original_config + '\n[all]\n# Video Game Filter USB controller\n' + '\n'.join(settings) + '\n')
                 if before_commit: before_commit()
                 command_path.write_text(' '.join(updated) + '\n')
         except Exception:

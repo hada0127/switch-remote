@@ -21,6 +21,11 @@ int main(void){
     assert(vgf_decode(p,56,key,&seq,&v)<0);seq=0;p[12]^=1;assert(vgf_decode(p,56,key,&seq,&v)<0&&seq==0);p[12]^=1;
     for(size_t n=0;n<56;n++)assert(vgf_decode(p,n,key,&seq,&v)<0);
     p[15]=0x80;sign_packet(p,key);assert(vgf_decode(p,56,key,&seq,&v)<0);p[15]=0;sign_packet(p,key);
+    /* Shared 44-byte vector with Swift's testAckWireLayoutMatchesNativeVector. */
+    uint8_t ack[VGF_ACK_SIZE];vgf_ack(key,42,ack);const uint8_t ack_vector[VGF_ACK_SIZE]={0,0,0,0,0,0,0,42,'V','G','F','A',
+        0xe3,0x8b,0x9b,0x11,0x20,0x8a,0x05,0x3c,0xbd,0xee,0x32,0xca,0xae,0x1d,0x44,0xda,0x5f,0x02,0x53,0xa8,
+        0x4a,0x10,0x59,0x71,0x8a,0x8f,0x74,0x74,0xd3,0x2e,0xb3,0x80};
+    assert(!memcmp(ack,ack_vector,VGF_ACK_SIZE));
     vgf_protocol proto={.address={1,2,3,4,5,6}};uint8_t r[50],in[50]={0xa2,1};
     assert(vgf_report_interval(&proto,0)==.066);assert(vgf_report_interval(&proto,1)==.008);
     proto.vibration=true;assert(vgf_report_interval(&proto,0)==.066);proto.player=1;assert(vgf_report_interval(&proto,0)==.015);
@@ -33,10 +38,10 @@ int main(void){
     v.buttons=(1u<<A)|(1u<<B)|(1u<<HOME)|(1u<<UP)|(1u<<RIGHT);v.axis[0]=-32768;v.axis[1]=32767;v.axis[2]=32767;v.axis[3]=-32768;vgf_usb_report(&v,u);
     assert(u[0]==6&&u[1]==0x10&&u[2]==1&&u[3]==0&&u[4]==0&&u[5]==255&&u[6]==255);
     double samples[10000];struct timespec start,end;
-    for(int i=0;i<10000;i++){seq=0;clock_gettime(CLOCK_MONOTONIC,&start);assert(vgf_decode(p,56,key,&seq,&v)==0);vgf_report(&proto,&v,NULL,0,100+i*.008,r);clock_gettime(CLOCK_MONOTONIC,&end);samples[i]=(end.tv_sec-start.tv_sec)*1e6+(end.tv_nsec-start.tv_nsec)/1e3;}
+    for(int i=0;i<10000;i++){seq=0;clock_gettime(CLOCK_MONOTONIC,&start);assert(vgf_decode(p,56,key,&seq,&v)==0);vgf_report(&proto,&v,NULL,0,100+i*.008,r);vgf_ack(key,seq,ack);clock_gettime(CLOCK_MONOTONIC,&end);samples[i]=(end.tv_sec-start.tv_sec)*1e6+(end.tv_nsec-start.tv_nsec)/1e3;}
     /* Insertion sort only after measurement. */
     for(int i=1;i<10000;i++){double x=samples[i];int j=i;while(j&&samples[j-1]>x){samples[j]=samples[j-1];j--;}samples[j]=x;}
-    printf("PASS protocol, HMAC/replay, chords, hold/release, bounded queue, SPI bounds, USB report\n");
-    printf("decode+BT report CPU time us: p50=%.2f p95=%.2f p99=%.2f max=%.2f (10000 samples; excludes network/USB/BT delivery)\n",samples[5000],samples[9500],samples[9900],samples[9999]);
+    printf("PASS protocol, HMAC/replay, ack vector, chords, hold/release, bounded queue, SPI bounds, USB report\n");
+    printf("decode+BT report+ack CPU time us: p50=%.2f p95=%.2f p99=%.2f max=%.2f (10000 samples; excludes network/USB/BT delivery)\n",samples[5000],samples[9500],samples[9900],samples[9999]);
     return 0;
 }

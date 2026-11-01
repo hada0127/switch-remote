@@ -3,6 +3,7 @@
 #include <bluetooth/l2cap.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
+#include <linux/rfkill.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
@@ -94,4 +95,13 @@ void vgf_bt_close(vgf_bt *b) {
     int fds[]={b->ctrl,b->itr,b->listen_ctrl,b->listen_itr};for(int i=0;i<4;i++)if(fds[i]>=0)close(fds[i]);
     b->ctrl=b->itr=b->listen_ctrl=b->listen_itr=-1;
     if(b->bus){dbus_connection_close(b->bus);dbus_connection_unref(b->bus);b->bus=NULL;}
+}
+int vgf_bt_rfkill(int block) {
+    int fd=open("/dev/rfkill",O_RDWR|O_NONBLOCK|O_CLOEXEC);if(fd<0)return -1;
+    /* Opening queues one ADD event per radio with its current state. */
+    struct rfkill_event e;int changed=0;
+    while(read(fd,&e,RFKILL_EVENT_SIZE_V1)==RFKILL_EVENT_SIZE_V1)if(e.op==RFKILL_OP_ADD&&e.type==RFKILL_TYPE_BLUETOOTH&&e.soft!=!!block)changed=1;
+    if(changed){memset(&e,0,sizeof(e));e.op=RFKILL_OP_CHANGE_ALL;e.type=RFKILL_TYPE_BLUETOOTH;e.soft=(uint8_t)!!block;
+        if(write(fd,&e,RFKILL_EVENT_SIZE_V1)!=RFKILL_EVENT_SIZE_V1){int saved=errno;close(fd);errno=saved;return -1;}}
+    close(fd);return changed;
 }

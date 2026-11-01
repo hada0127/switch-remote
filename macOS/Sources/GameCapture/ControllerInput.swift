@@ -30,6 +30,7 @@ struct ControllerInput: Codable, Equatable {
             ("ZL", p.leftTrigger.isPressed), ("ZR", p.rightTrigger.isPressed),
             ("PLUS", p.buttonMenu.isPressed), ("MINUS", p.buttonOptions?.isPressed ?? false),
             ("HOME", p.buttonHome?.isPressed ?? false),
+            ("CAPTURE", (pad as? GCXboxGamepad)?.buttonShare?.isPressed ?? false),
             ("L_STICK_PRESS", p.leftThumbstickButton?.isPressed ?? false),
             ("R_STICK_PRESS", p.rightThumbstickButton?.isPressed ?? false),
             ("DPAD_UP", p.dpad.up.isPressed), ("DPAD_DOWN", p.dpad.down.isPressed),

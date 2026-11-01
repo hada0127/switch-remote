@@ -101,6 +101,9 @@ final class SSHControllerBridge: @unchecked Sendable {
             } catch { cleanup(); onMessage?("error", error.localizedDescription) }
         }
     }
+    func transportMetrics() -> TransportMetrics? {
+        queue.sync { active ? TransportMetrics(kind: "ssh", rtt: nil) : nil }
+    }
     func stop() {
         lock.lock(); latest = nil; lock.unlock()
         queue.async { [self] in

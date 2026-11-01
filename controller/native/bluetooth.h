@@ -10,4 +10,6 @@ int vgf_bt_listen(vgf_bt *);
 int vgf_bt_accept(vgf_bt *);
 int vgf_bt_ready(vgf_bt *);
 void vgf_bt_close(vgf_bt *);
+/* Soft-block (1) or unblock (0) every Bluetooth radio: 1 changed, 0 unchanged, -1 error. */
+int vgf_bt_rfkill(int block);
 #endif
