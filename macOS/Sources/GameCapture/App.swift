@@ -61,13 +61,16 @@ struct CaptureView: View {
     @State private var showDelete = false
     @State private var presetName = ""
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    private var useShader: Bool { (effects.settings.antiAliasing > 0 || effects.settings.crt || effects.settings.sharp || effects.settings.horizontal > 0 || effects.settings.vertical > 0) && model.renderer != nil && model.rendererError == nil }
+    private var useShader: Bool { model.renderer != nil && model.rendererError == nil }
 
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .bottom) {
                 Color.black
-                Preview(session: model.engine.session).opacity(model.hasFrames && !useShader ? 1 : 0).allowsHitTesting(false)
+                // AVCaptureVideoPreviewLayer leaks per-frame CFStrings on the CMIO thread; attach it only as the no-Metal fallback.
+                if !useShader {
+                    Preview(session: model.engine.session).opacity(model.hasFrames ? 1 : 0).allowsHitTesting(false)
+                }
                 if let renderer = model.renderer {
                     ShaderPreview(renderer: renderer, settings: effects.settings, enabled: model.running && useShader)
                         .opacity(model.hasFrames && useShader ? 1 : 0).allowsHitTesting(false)
@@ -335,4 +338,5 @@ struct Preview: NSViewRepresentable {
         let view = PreviewView(frame: .zero); view.preview.session = session; return view
     }
     func updateNSView(_ nsView: PreviewView, context: Context) {}
+    static func dismantleNSView(_ nsView: PreviewView, coordinator: ()) { nsView.preview.session = nil }
 }
