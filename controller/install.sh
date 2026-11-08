@@ -11,12 +11,43 @@ apt-get install -y bluez avahi-daemon iw util-linux build-essential pkg-config l
 install -d -m 755 /opt/videogamefilter-controller
 make -C native clean all check
 install -d -m 755 /opt/videogamefilter-controller/native
-install -m 755 native/vgf-controller native/usb-gadget.sh native/usb-control.sh native/usb-watch.sh /opt/videogamefilter-controller/native/
+install -m 755 native/vgf-controller native/usb-gadget.sh native/usb-control.sh native/usb-watch.sh native/net-watch.sh /opt/videogamefilter-controller/native/
 install -m 644 native/switch-controller.xml /opt/videogamefilter-controller/native/
 install -m 644 vendor/NXBT-LICENSE /opt/videogamefilter-controller/native/
 chown -R root:root /opt/videogamefilter-controller
 chmod -R go-w /opt/videogamefilter-controller
 rfkill unblock bluetooth
+# Wi-Fi self-heal: NetworkManager gives up after 4 failed retries by default,
+# which left the Pi offline for days after an AP rejection. Retry forever,
+# keep brcmf power save off, and run a gateway watchdog.
+install -d -m 755 /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/90-vgf-wifi.conf <<'NMCONF'
+[connection]
+connection.autoconnect-retries=0
+wifi.powersave=2
+NMCONF
+chmod 644 /etc/NetworkManager/conf.d/90-vgf-wifi.conf
+cat > /etc/systemd/system/vgf-net-watch.service <<'NETWATCH'
+[Unit]
+Description=vgf Wi-Fi self-heal check
+After=NetworkManager.service
+[Service]
+Type=oneshot
+ExecStart=/opt/videogamefilter-controller/native/net-watch.sh
+NETWATCH
+cat > /etc/systemd/system/vgf-net-watch.timer <<'NETTIMER'
+[Unit]
+Description=Run vgf-net-watch every 2 minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+[Install]
+WantedBy=timers.target
+NETTIMER
+chmod 644 /etc/systemd/system/vgf-net-watch.service /etc/systemd/system/vgf-net-watch.timer
+systemctl daemon-reload
+systemctl reload NetworkManager 2>/dev/null || true
+systemctl enable --now vgf-net-watch.timer
 if [ -d identity ]; then
     install -d -m 700 /var/lib/videogamefilter-controller
     systemctl stop vgf-controller.service 2>/dev/null || true
