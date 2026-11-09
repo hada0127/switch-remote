@@ -231,6 +231,25 @@ final class SerialControlTests: XCTestCase {
         XCTAssertFalse(recorder.contains("link-error", nil) || recorder.contains("error", nil))
     }
 
+    // App termination: BYE must already be on the wire when stopNow returns.
+    func testPtySerialStopNowWritesByeBeforeReturn() throws {
+        let pi = try makePty()
+        let recorder = BridgeRecorder()
+        let bridge = PiControlBridge()
+        bridge.onMessage = { state, message in recorder.message(state, message) }
+        bridge.startSerial(device: device(), path: pi.path)
+        let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1), "no HELLO")
+        let nonce = SerialControl.readBigEndian(hello, at: 1)
+        pi.write(SerialFrame.make(control: SerialControl.helloReply, body: [1, 0] + SerialControl.bigEndian(nonce) + goldenIDBytes))
+        pi.write(SerialFrame.make(control: SerialControl.status, body: [3, 1] + Array("configured".utf8)))
+        XCTAssertTrue(wait(2) { recorder.contains("connected", nil) },
+                      "messages: \(recorder.messages)")
+
+        bridge.stopNow()
+        let bye = try XCTUnwrap(pi.nextControl(SerialControl.bye, timeout: 0), "BYE not written before stopNow returned")
+        XCTAssertEqual(SerialControl.readBigEndian(bye, at: 0), nonce)
+    }
+
     // Pi BYE reason 2 (cable input lost) retries on the other link; reason 1 (session end) does not.
     func testPtySerialPiByeReasons() throws {
         for (reason, expected) in [(UInt8(2), "link-error"), (UInt8(1), "error")] {

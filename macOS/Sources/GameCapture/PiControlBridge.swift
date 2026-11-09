@@ -415,6 +415,8 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         buffer = Data()
     }
     func stop() { queue.async { [self] in finish() } }
+    /// Writes the closing frames before returning (app termination). Never call from `queue`.
+    func stopNow() { queue.sync { [self] in finish() } }
     /// Never call from `queue`.
     func transportMetrics() -> TransportMetrics? {
         queue.sync {
