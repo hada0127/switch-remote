@@ -5,6 +5,7 @@ final class SerialFrameTests: XCTestCase {
     func testUSBControlWaitsForAuthenticatedTransport() {
         XCTAssertFalse(PiControlBridge.canControlUSB(active: true, hasAuthenticatedTransport: false))
         XCTAssertFalse(PiControlBridge.canControlUSB(active: false, hasAuthenticatedTransport: true))
+        // TLS sessions count UDP as authenticated; serial control sessions count a READY serial link.
         XCTAssertTrue(PiControlBridge.canControlUSB(active: true, hasAuthenticatedTransport: true))
     }
     func testSerialHealthAndFallbackDecision() {
@@ -27,9 +28,9 @@ final class SerialFrameTests: XCTestCase {
         let check = SerialFrame.crc(ack[2...])
         ack += [UInt8(truncatingIfNeeded: check), UInt8(truncatingIfNeeded: check >> 8)]
         XCTAssertEqual(SerialFrame.ackSequence(ack), 9)
-        var parser = SerialAckParser()
+        var parser = SerialFrameParser()
         XCTAssertTrue(parser.feed(([0xff] + Array(ack.prefix(6)))[...]).isEmpty)
-        XCTAssertEqual(parser.feed(ack[6...]), [9])
+        XCTAssertEqual(parser.feed(ack[6...]), [.ack(9)])
         ack[10] ^= 1
         XCTAssertNil(SerialFrame.ackSequence(ack))
         XCTAssertTrue(parser.feed(ack[...]).isEmpty)
