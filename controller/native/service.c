@@ -118,12 +118,72 @@ static void hid_release(int fd,int usb,vgf_protocol *protocol){
         if((poll(&p,1,20)<0&&errno!=EINTR)||(p.revents&(POLLERR|POLLHUP|POLLNVAL)))return;
     }
 }
-static void session(SSL *ssl,int tcp,int pair){
-    int lock=open("/run/videogamefilter-controller.lock",O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600),udp=-1,serial=-1;
+#define VGF_SESSION_LOCK "/run/videogamefilter-controller.lock"
+#define VGF_SERIAL_LOCK "/run/vgf-serial.lock"
+#define VGF_SERIAL_DEVICE "/dev/serial0"
+#ifndef VGF_SERIAL_PEER_TIMEOUT
+#define VGF_SERIAL_PEER_TIMEOUT 5.0
+#endif
+static double serial_peer_timeout=VGF_SERIAL_PEER_TIMEOUT;
+static int lock_file(const char *path){return open(path,O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);}
+/* Non-blocking flock, retried `attempts` times `interval_ms` apart. */
+static int try_lock(int fd,int attempts,int interval_ms){
+    for(int i=0;fd>=0&&i<attempts;i++){
+        if(i)poll(NULL,0,interval_ms);
+        if(!flock(fd,LOCK_EX|LOCK_NB))return 0;
+        if(errno!=EWOULDBLOCK&&errno!=EINTR)return -1;
+    }
+    return -1;
+}
+static void put32(uint8_t *p,uint32_t v){p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(v>>16);p[2]=(uint8_t)(v>>8);p[3]=(uint8_t)v;}
+static uint32_t get32(const uint8_t *p){return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];}
+/* Cable control frames carry no secrets: only nonces, public device id, state.
+   A partial write is dropped; the Mac's CRC check discards the fragment. */
+static void serial_send(int fd,uint8_t type,const uint8_t body[VGF_SERIAL_BODY]){
+    if(fd<0)return;uint8_t frame[VGF_SERIAL_CONTROL];vgf_serial_control_frame(type,body,frame);
+    for(int retry=0;retry<2;retry++){
+        ssize_t n=write(fd,frame,sizeof(frame));
+        if(n>=0||(errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR))return;
+        struct pollfd p={fd,POLLOUT,0};poll(&p,1,10);
+    }
+}
+static void serial_hello_reply(int fd,uint8_t result,uint32_t nonce,const uint8_t *id){
+    uint8_t b[VGF_SERIAL_BODY]={VGF_SERIAL_VERSION,result};put32(b+2,nonce);if(id)memcpy(b+6,id,16);serial_send(fd,VGF_SERIAL_HELLO_REPLY,b);
+}
+static void serial_status(int fd,uint8_t state,uint8_t backend,const char *usb){
+    uint8_t b[VGF_SERIAL_BODY]={state,backend};if(usb){size_t n=strlen(usb);if(n>16)n=16;memcpy(b+2,usb,n);}serial_send(fd,VGF_SERIAL_STATUS,b);
+}
+static void serial_usb_result(int fd,uint32_t id,uint8_t result){uint8_t b[VGF_SERIAL_BODY]={0};put32(b,id);b[4]=result;serial_send(fd,VGF_SERIAL_USB_RESULT,b);}
+static void serial_bye(int fd,uint32_t nonce,uint8_t reason){uint8_t b[VGF_SERIAL_BODY]={0};put32(b,nonce);b[4]=reason;serial_send(fd,VGF_SERIAL_PI_BYE,b);}
+/* USB detach/attach semantics shared by TLS and cable control: release HID
+   input before the helper runs. 1 = attached (end session), 0 = detached, -1 = detach failed. */
+static int usb_control(int attach,vgf_bt *bt,vgf_protocol *protocol,int *connected,int *use_usb){
+    if(*connected&&bt->itr>=0){hid_release(bt->itr,*use_usb,protocol);vgf_bt_close(bt);}
+    *connected=0;
+    if(attach){if(VGF_USB_COMMAND("attach"))fprintf(stderr,"USB attach failed\n");return 1;}
+    *use_usb=0;
+    if(VGF_USB_COMMAND("detach")){fprintf(stderr,"USB detach failed\n");return -1;}
+    return 0;
+}
+/* tcp>=0: authenticated TLS session (uart unused, pass -1).
+   tcp<0: cable control session on the supervisor's uart; no SSL call is made. */
+static void session(SSL *ssl,int tcp,int pair,int uart,uint32_t nonce,const uint8_t device_id[16]){
+    const int serial_mode=tcp<0;
+    int lock=lock_file(VGF_SESSION_LOCK),serial_lock=-1,udp=-1,serial=serial_mode?uart:-1;
     vgf_bt bt={.ctrl=-1,.itr=-1,.listen_ctrl=-1,.listen_itr=-1};vgf_queue queue={0};vgf_protocol protocol={0};unsigned char key[32]={0};
     uint64_t sequence=0,accepted=0,serial_accepted=0,serial_invalid=0,invalid=0,reports=0,blocked=0,udp_gaps=0;double max_gap=0,last_sent=0,max_udp_gap=0,last_udp=0;int connected=0,use_usb=0,listening=0,detached=access("/run/vgf-usb-manual-detach",F_OK)==0;vgf_serial_parser serial_parser={0};uint64_t serial_ack_sequence=0;
-    if(lock<0||flock(lock,LOCK_EX|LOCK_NB)<0){send_blocking(ssl,"{\"type\":\"error\",\"message\":\"다른 컨트롤러 연결이 사용 중입니다.\"}\n");goto done;}
-    if(send_blocking(ssl,"{\"type\":\"status\",\"state\":\"starting\",\"wake\":false}\n"))goto done;
+    int reason=VGF_SERIAL_BYE_ENDED,send_bye=0;uint32_t last_usb_id=0;uint8_t last_usb_result=VGF_SERIAL_USB_ACCEPTED;
+    /* The serial supervisor briefly probes S every 50ms; a TLS login retries past that. */
+    if(lock<0||try_lock(lock,serial_mode?1:11,10)){
+        if(serial_mode)serial_hello_reply(serial,VGF_SERIAL_HELLO_BUSY,nonce,device_id);
+        else send_blocking(ssl,"{\"type\":\"error\",\"message\":\"다른 컨트롤러 연결이 사용 중입니다.\"}\n");
+        goto done;
+    }
+    if(serial_mode){
+        serial_hello_reply(serial,VGF_SERIAL_HELLO_OK,nonce,device_id);send_bye=1;
+        fputs("serial control session started\n",stderr);
+        serial_status(serial,VGF_SERIAL_STARTING,VGF_SERIAL_BACKEND_NONE,NULL);
+    }else if(send_blocking(ssl,"{\"type\":\"status\",\"state\":\"starting\",\"wake\":false}\n"))goto done;
     if(detached){fputs("USB manually detached; waiting for authenticated attach\n",stderr);}
     else if(!pair && (bt.itr=vgf_usb_open())>=0){use_usb=1;connected=1;
         /* USB needs no radio. An idle BT controller still takes coexistence airtime from Wi-Fi. */
@@ -132,18 +192,23 @@ static void session(SSL *ssl,int tcp,int pair){
         int unblocked=vgf_bt_rfkill(0);if(unblocked<0)fprintf(stderr,"Bluetooth rfkill unblock failed: %s\n",strerror(errno));
         /* bluetoothd observes the unblock asynchronously; Powered may briefly report Blocked. */
         for(int retry=0;vgf_bt_setup(&bt,sdp);retry++){vgf_bt_close(&bt);
-            if(unblocked<=0||retry==4){send_blocking(ssl,"{\"type\":\"error\",\"message\":\"블루투스 초기화 실패\"}\n");goto done;}usleep(250000);}
+            if(unblocked<=0||retry==4){reason=VGF_SERIAL_BYE_BLUETOOTH;if(!serial_mode)send_blocking(ssl,"{\"type\":\"error\",\"message\":\"블루투스 초기화 실패\"}\n");goto done;}usleep(250000);}
         char address[18];listening=pair||console_address(address)||vgf_bt_connect(&bt,address);
-        if(listening&&vgf_bt_listen(&bt))goto done;
+        if(listening&&vgf_bt_listen(&bt)){reason=VGF_SERIAL_BYE_BLUETOOTH;goto done;}
         char own[18];ba2str(&bt.local,own);for(int i=0;i<6;i++){unsigned n=0;sscanf(own+i*3,"%2x",&n);protocol.address[i]=(uint8_t)n;}
     }
-    udp=socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(udp<0)goto done;
-    struct sockaddr_in sa={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY)};if(bind(udp,(struct sockaddr*)&sa,sizeof(sa))<0)goto done;
-    socklen_t sz=sizeof(sa);if(getsockname(udp,(struct sockaddr*)&sa,&sz)<0||RAND_bytes(key,32)!=1)goto done;
-    unsigned char encoded[45];EVP_EncodeBlock(encoded,key,32);char msg[512];snprintf(msg,sizeof(msg),"{\"type\":\"transport\",\"version\":2,\"port\":%u,\"key\":\"%s\"}\n",ntohs(sa.sin_port),encoded);
-    if(send_blocking(ssl,msg)||set_nonblocking(tcp)<0)goto done;
-    serial=vgf_serial_open("/dev/serial0");if(serial>=0)fputs("serial input ready at 115200\n",stderr);
-    double started=now_s(),next_report=started,next_status=started,last_input=started,out_started=0,next_usb_check=0;
+    if(!serial_mode){
+        udp=socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);if(udp<0)goto done;
+        struct sockaddr_in sa={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY)};if(bind(udp,(struct sockaddr*)&sa,sizeof(sa))<0)goto done;
+        socklen_t sz=sizeof(sa);if(getsockname(udp,(struct sockaddr*)&sa,&sz)<0||RAND_bytes(key,32)!=1)goto done;
+        unsigned char encoded[45];EVP_EncodeBlock(encoded,key,32);char msg[512];snprintf(msg,sizeof(msg),"{\"type\":\"transport\",\"version\":2,\"port\":%u,\"key\":\"%s\"}\n",ntohs(sa.sin_port),encoded);
+        /* Take the UART from the serial supervisor before the Mac starts serial input. */
+        serial_lock=lock_file(VGF_SERIAL_LOCK);
+        if(!try_lock(serial_lock,21,10)){serial=vgf_serial_open(VGF_SERIAL_DEVICE);if(serial>=0)fputs("serial input ready at 115200\n",stderr);}
+        else fputs(serial_lock<0?"serial input unavailable: lock open failed\n":"serial input unavailable: owned by serial control\n",stderr);
+        if(send_blocking(ssl,msg)||set_nonblocking(tcp)<0)goto done;
+    }
+    double started=now_s(),next_report=started,next_status=started,last_input=started,out_started=0,next_usb_check=0,last_peer=started;
     char output[512]={0},control_line[128]={0};size_t output_len=0,output_at=0,control_len=0;int output_want_read=0;
     uint8_t pending_report[50];double report_started=0;int have_report=0;vgf_input current={0};
     uint64_t ack_sequence=0;struct sockaddr_in ack_to;
@@ -164,7 +229,7 @@ static void session(SSL *ssl,int tcp,int pair){
         int wait_ms=(int)ceil((next_report-now)*1000);if(wait_ms<0)wait_ms=0;if(wait_ms>8||!connected||(use_usb&&have_report))wait_ms=8;
         int pr=poll(fds,5,wait_ms);if(pr<0&&errno!=EINTR)break;now=now_s();
         if(fds[0].revents&(POLLERR|POLLHUP|POLLNVAL))break;
-        if((fds[0].revents&POLLIN)||SSL_pending(ssl)){
+        if(tcp>=0&&((fds[0].revents&POLLIN)||SSL_pending(ssl))){
             char incoming[1024];int n=SSL_read(ssl,incoming,sizeof(incoming));if(n<=0){int e=SSL_get_error(ssl,n);if(e!=SSL_ERROR_WANT_READ&&e!=SSL_ERROR_WANT_WRITE)break;}
             else for(int i=0;i<n;i++){
                 if(incoming[i]=='\n'){
@@ -173,13 +238,10 @@ static void session(SSL *ssl,int tcp,int pair){
                     const char *type=string(request,"type"),*action=string(request,"action");
                     if(type&&!strcmp(type,"usb")&&action){
                         if(!strcmp(action,"detach")){
-                            if(connected&&bt.itr>=0){hid_release(bt.itr,use_usb,&protocol);vgf_bt_close(&bt);}
-                            connected=0;use_usb=0;
-                            if(VGF_USB_COMMAND("detach")){fprintf(stderr,"USB detach failed\n");goto done;}
+                            if(usb_control(0,&bt,&protocol,&connected,&use_usb)){if(request)json_object_put(request);goto done;}
                             detached=1;queue.count=0;have_report=0;current=(vgf_input){0};next_status=0;
                         }else if(!strcmp(action,"attach")){
-                            if(connected&&bt.itr>=0){hid_release(bt.itr,use_usb,&protocol);vgf_bt_close(&bt);connected=0;}
-                            if(VGF_USB_COMMAND("attach"))fprintf(stderr,"USB attach failed\n");
+                            usb_control(1,&bt,&protocol,&connected,&use_usb);
                             if(request)json_object_put(request);goto done;
                         }
                     }
@@ -197,14 +259,44 @@ static void session(SSL *ssl,int tcp,int pair){
                 if(use_usb||(protocol.vibration&&protocol.player)){double due=fmax(now,last_sent+(use_usb?.001:.004));if(due<next_report)next_report=due;}
             }
         }
-        if(serial>=0 && (fds[4].revents&(POLLERR|POLLHUP|POLLNVAL))){close(serial);serial=-1;fputs("serial input disconnected; UDP remains active\n",stderr);}
+        if(serial>=0 && (fds[4].revents&(POLLERR|POLLHUP|POLLNVAL))){
+            /* The supervisor owns a cable-control uart; end without BYE. */
+            if(serial_mode){fputs("serial control link lost\n",stderr);send_bye=0;break;}
+            close(serial);serial=-1;fputs("serial input disconnected; UDP remains active\n",stderr);
+        }
         if(serial>=0 && (fds[4].revents&POLLIN)){
             uint8_t bytes[256];ssize_t n=read(serial,bytes,sizeof(bytes));
-            if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK){close(serial);serial=-1;}
+            if(n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK){if(serial_mode){fputs("serial control link lost\n",stderr);send_bye=0;break;}close(serial);serial=-1;}
             else for(ssize_t i=0;i<n;i++){
-                vgf_input v;uint64_t seq;
-                double arrived=now_s();int result=vgf_serial_byte(&serial_parser,bytes[i],&v,&seq);
+                vgf_input v;uint64_t seq;vgf_serial_control c;
+                double arrived=now_s();int result=vgf_serial_byte(&serial_parser,bytes[i],&v,&seq,&c);
                 if(result<0){serial_invalid++;continue;}if(!result)continue;
+                if(serial_mode)last_peer=arrived;
+                if(result==2){
+                    if(!serial_mode){
+                        /* The Mac fell back to the cable; the stale TLS session must not hold the lock. */
+                        if(c.type==VGF_SERIAL_HELLO){fputs("serial control takeover: ending TLS session\n",stderr);goto done;}
+                        continue;
+                    }
+                    if(c.type==VGF_SERIAL_HELLO){
+                        uint32_t hello=get32(c.body+1);if(!hello)continue;
+                        if(hello==nonce){serial_hello_reply(serial,VGF_SERIAL_HELLO_OK,nonce,device_id);continue;}
+                        fputs("serial control replaced by a new HELLO\n",stderr);reason=VGF_SERIAL_BYE_REPLACED;goto done;
+                    }
+                    if(c.type==VGF_SERIAL_BYE){if(get32(c.body)==nonce){reason=VGF_SERIAL_BYE_ENDED;goto done;}continue;}
+                    if(c.type==VGF_SERIAL_USB){
+                        uint32_t id=get32(c.body);uint8_t action=c.body[4];if(!id)continue;
+                        /* A retransmitted command is answered, never executed twice. */
+                        if(id==last_usb_id){serial_usb_result(serial,id,last_usb_result);continue;}
+                        last_usb_id=id;last_usb_result=(action==VGF_SERIAL_USB_DETACH||action==VGF_SERIAL_USB_ATTACH)?VGF_SERIAL_USB_ACCEPTED:VGF_SERIAL_USB_REJECTED;
+                        serial_usb_result(serial,id,last_usb_result);if(last_usb_result!=VGF_SERIAL_USB_ACCEPTED)continue;
+                        int r=usb_control(action==VGF_SERIAL_USB_ATTACH,&bt,&protocol,&connected,&use_usb);
+                        if(r>0){reason=VGF_SERIAL_BYE_ATTACH;goto done;}
+                        if(r<0){reason=VGF_SERIAL_BYE_USB_FAILED;goto done;}
+                        detached=1;queue.count=0;have_report=0;current=(vgf_input){0};next_status=0;
+                    }
+                    continue;
+                }
                 /* The serial parser already checks its own increasing sequence.
                    A Wi-Fi copy can arrive first; acknowledge that older serial
                    frame after HID delivery without replaying its stale state. */
@@ -213,6 +305,8 @@ static void session(SSL *ssl,int tcp,int pair){
                 if(use_usb||(protocol.vibration&&protocol.player)){double due=fmax(arrived,last_sent+(use_usb?.001:.004));if(due<next_report)next_report=due;}
             }
         }
+        /* Checked after this iteration's reads so a frame that just arrived counts. */
+        if(serial_mode&&now_s()-last_peer>serial_peer_timeout){fputs("serial control peer timeout\n",stderr);reason=VGF_SERIAL_BYE_PEER_TIMEOUT;break;}
         if(!connected&&!detached){
             int ready=listening?vgf_bt_accept(&bt):vgf_bt_ready(&bt);
             if(ready<0 || (!listening&&now-started>8)){
@@ -255,16 +349,97 @@ static void session(SSL *ssl,int tcp,int pair){
            been written to HID. Earlier sequences in the batch go unacknowledged. Old apps never read acks. */
         if(ack_sequence&&!queue.count&&!have_report){uint8_t ack[VGF_ACK_SIZE];vgf_ack(key,ack_sequence,ack);(void)sendto(udp,ack,sizeof(ack),MSG_DONTWAIT,(struct sockaddr*)&ack_to,sizeof(ack_to));ack_sequence=0;}
         if(serial_ack_sequence&&!queue.count&&!have_report&&serial>=0){uint8_t ack[VGF_SERIAL_ACK];vgf_serial_ack(serial_ack_sequence,ack);ssize_t sent=write(serial,ack,sizeof(ack));if(sent>0)serial_ack_sequence=0;}
-        if(now>=next_status&&!output_len){status_line(output,sizeof(output),detached?"detached":(connected?"connected":(listening?"connecting":"reconnecting")),use_usb);output_len=strlen(output);output_at=0;out_started=now;next_status=now+.5;}
-        if(output_len){int n=SSL_write(ssl,output+output_at,(int)(output_len-output_at));if(n>0){output_at+=(size_t)n;output_want_read=0;if(output_at==output_len)output_at=output_len=0;}
+        if(now>=next_status&&!output_len){
+            if(serial_mode){
+                serial_status(serial,detached?VGF_SERIAL_DETACHED:(connected?VGF_SERIAL_CONNECTED:(listening?VGF_SERIAL_CONNECTING:VGF_SERIAL_RECONNECTING)),use_usb?VGF_SERIAL_BACKEND_USB:VGF_SERIAL_BACKEND_BLUETOOTH,vgf_usb_state());
+                next_status=now+.5;
+            }else{status_line(output,sizeof(output),detached?"detached":(connected?"connected":(listening?"connecting":"reconnecting")),use_usb);output_len=strlen(output);output_at=0;out_started=now;next_status=now+.5;}
+        }
+        if(tcp>=0&&output_len){int n=SSL_write(ssl,output+output_at,(int)(output_len-output_at));if(n>0){output_at+=(size_t)n;output_want_read=0;if(output_at==output_len)output_at=output_len=0;}
             else {int e=SSL_get_error(ssl,n);if(e!=SSL_ERROR_WANT_READ&&e!=SSL_ERROR_WANT_WRITE)break;output_want_read=e==SSL_ERROR_WANT_READ;}
             if(output_len&&now-out_started>2)break;
         }
     }
+    if(stopping)reason=VGF_SERIAL_BYE_SHUTDOWN;
  done:
     if(connected&&bt.itr>=0)hid_release(bt.itr,use_usb,&protocol);
-    fprintf(stderr,"session end: input=%llu invalid=%llu reports=%llu blocked=%llu max_report_gap_ms=%.2f dropped_edges=%llu max_udp_gap_ms=%.2f udp_gaps_over_40ms=%llu serial_input=%llu serial_invalid=%llu\n",(unsigned long long)accepted,(unsigned long long)invalid,(unsigned long long)reports,(unsigned long long)blocked,max_gap*1000,(unsigned long long)queue.discarded,max_udp_gap*1000,(unsigned long long)udp_gaps,(unsigned long long)serial_accepted,(unsigned long long)serial_invalid);
-    vgf_bt_close(&bt);if(udp>=0)close(udp);if(serial>=0)close(serial);OPENSSL_cleanse(key,32);if(lock>=0)close(lock);
+    if(serial_mode&&send_bye)serial_bye(serial,nonce,(uint8_t)reason);
+    fprintf(stderr,"session end: input=%llu invalid=%llu reports=%llu blocked=%llu max_report_gap_ms=%.2f dropped_edges=%llu max_udp_gap_ms=%.2f udp_gaps_over_40ms=%llu serial_input=%llu serial_invalid=%llu link=%s\n",(unsigned long long)accepted,(unsigned long long)invalid,(unsigned long long)reports,(unsigned long long)blocked,max_gap*1000,(unsigned long long)queue.discarded,max_udp_gap*1000,(unsigned long long)udp_gaps,(unsigned long long)serial_accepted,(unsigned long long)serial_invalid,serial_mode?"serial":"tls");
+    vgf_bt_close(&bt);if(udp>=0)close(udp);OPENSSL_cleanse(key,32);
+    /* A cable-control uart belongs to the supervisor; a TLS session returns U after closing the uart. */
+    if(!serial_mode&&serial>=0)close(serial);
+    if(serial_lock>=0)close(serial_lock);
+    if(lock>=0)close(lock);
+}
+/* device.json id as 16 bytes: the UUID string's hex digits, dashes removed. */
+static int device_id_bytes(uint8_t out[16]){
+    char path[512];path_for(path,"device.json");json_object *d=json_object_from_file(path);
+    const char *s=string(d,"id");int r=s&&strlen(s)==36?0:-1;size_t j=0;
+    for(size_t i=0;!r&&i<36;i++){
+        if(i==8||i==13||i==18||i==23){if(s[i]!='-')r=-1;continue;}
+        int c=tolower((unsigned char)s[i]),v=c>='0'&&c<='9'?c-'0':(c>='a'&&c<='f'?c-'a'+10:-1);
+        if(v<0){r=-1;break;}
+        if(j&1)out[j/2]|=(uint8_t)v;else out[j/2]=(uint8_t)(v<<4);j++;
+    }
+    if(d)json_object_put(d);return r;
+}
+/* Owns /dev/serial0 (lock U) while no TLS session holds the controller lock S.
+   Idle: answer HELLO, ignore everything else. When S is taken by a TLS
+   session, close the uart and release U so that session can read cable input. */
+static void serial_supervisor(void){
+    /* No SA_RESTART: SIGTERM must interrupt the one blocking flock below. */
+    struct sigaction sa;memset(&sa,0,sizeof(sa));sa.sa_handler=stop;sigemptyset(&sa.sa_mask);sigaction(SIGTERM,&sa,NULL);sigaction(SIGINT,&sa,NULL);
+    int session_lock=lock_file(VGF_SESSION_LOCK),serial_lock=lock_file(VGF_SERIAL_LOCK),uart=-1,owned=0,open_logged=0;
+    vgf_serial_parser parser={0};double next_open=0,next_probe=0;
+    if(session_lock<0||serial_lock<0){perror("serial control lock");goto done;}
+    fputs("serial control supervisor started\n",stderr);
+    while(!stopping){
+        if(!owned){
+            /* YIELD: wait for S to be free, then take U back. Only an ending TLS
+               session can still hold U here, so the blocking wait is short. */
+            if(flock(session_lock,LOCK_EX|LOCK_NB)<0){poll(NULL,0,50);continue;}
+            int r;while((r=flock(serial_lock,LOCK_EX))<0&&errno==EINTR&&!stopping);
+            flock(session_lock,LOCK_UN);
+            if(r<0)continue;
+            owned=1;next_open=0;next_probe=now_s()+.05;
+        }
+        double now=now_s();
+        if(uart<0&&now>=next_open){
+            uart=vgf_serial_open(VGF_SERIAL_DEVICE);
+            if(uart<0){if(!open_logged)fprintf(stderr,"serial control unavailable: %s\n",strerror(errno));open_logged=1;next_open=now+1;}
+            else {open_logged=0;parser=(vgf_serial_parser){0};fputs("serial control ready at 115200\n",stderr);}
+        }
+        struct pollfd p={uart,POLLIN,0};
+        if(poll(&p,1,20)<0&&errno!=EINTR)break;
+        if(uart>=0&&(p.revents&(POLLERR|POLLHUP|POLLNVAL))){close(uart);uart=-1;next_open=now_s()+1;}
+        else if(uart>=0&&(p.revents&POLLIN)){
+            uint8_t bytes[256];ssize_t n=read(uart,bytes,sizeof(bytes));
+            if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR){close(uart);uart=-1;next_open=now_s()+1;}
+            for(ssize_t i=0;i<n;i++){
+                vgf_input v;uint64_t seq;vgf_serial_control c;
+                /* Idle: input, USB and BYE frames get no reply and no ack. */
+                if(vgf_serial_byte(&parser,bytes[i],&v,&seq,&c)!=2||c.type!=VGF_SERIAL_HELLO)continue;
+                uint32_t nonce=get32(c.body+1);uint8_t id[16];if(!nonce)continue;
+                if(device_id_bytes(id)){serial_hello_reply(uart,VGF_SERIAL_HELLO_UNREGISTERED,nonce,NULL);continue;}
+                if(c.body[0]!=VGF_SERIAL_VERSION){serial_hello_reply(uart,VGF_SERIAL_HELLO_VERSION,nonce,id);continue;}
+                session(NULL,-1,0,uart,nonce,id);
+                /* Bytes buffered before the session are stale now. */
+                parser=(vgf_serial_parser){0};next_probe=0;break;
+            }
+        }
+        if(now_s()>=next_probe){
+            next_probe=now_s()+.05;
+            if(!flock(session_lock,LOCK_EX|LOCK_NB))flock(session_lock,LOCK_UN);
+            else if(errno==EWOULDBLOCK){
+                if(uart>=0){close(uart);uart=-1;}
+                flock(serial_lock,LOCK_UN);owned=0;fputs("serial control yielded to TLS session\n",stderr);
+            }
+        }
+    }
+ done:
+    if(uart>=0)close(uart);
+    if(serial_lock>=0)close(serial_lock);
+    if(session_lock>=0)close(session_lock);
 }
 static void client(SSL_CTX *ctx,int fd){
     struct timeval timeout={10,0};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
@@ -276,8 +451,17 @@ static void client(SSL_CTX *ctx,int fd){
     int issued=authenticate(request,token,id);if(issued<0){send_blocking(ssl,"{\"type\":\"error\",\"message\":\"파이 등록 정보가 일치하지 않거나 등록 시도가 너무 많습니다.\"}\n");goto done;}
     if(issued){char msg[128];snprintf(msg,sizeof(msg),"{\"type\":\"enrolled\",\"token\":\"%s\"}\n",token);if(send_blocking(ssl,msg))goto done;
         json_object *r=read_json(ssl);const char *t=string(r,"type");int ok=t&&!strcmp(t,"confirm");if(r)json_object_put(r);if(!ok||confirm(id))goto done;}
-    alarm(0);session(ssl,fd,truth(request,"pair"));
+    alarm(0);session(ssl,fd,truth(request,"pair"),-1,0,NULL);
  done:alarm(0);OPENSSL_cleanse(token,sizeof(token));if(request)json_object_put(request);SSL_free(ssl);close(fd);
+}
+static pid_t start_supervisor(int listener,SSL_CTX *ctx){
+    pid_t pid=fork();
+    if(pid==0){close(listener);SSL_CTX_free(ctx);serial_supervisor();_exit(0);}
+    return pid>0?pid:0;
+}
+static void reap(pid_t pid,double deadline){
+    while(waitpid(pid,NULL,WNOHANG)==0&&now_s()<deadline)usleep(10000);
+    if(waitpid(pid,NULL,WNOHANG)==0){kill(pid,SIGKILL);waitpid(pid,NULL,0);}
 }
 int main(int argc,char **argv){
     if(argc==2&&!strcmp(argv[1],"--hid-descriptor")){vgf_usb_descriptor();return ferror(stdout)?1:0;}
@@ -290,14 +474,17 @@ int main(int argc,char **argv){
     int fd=socket(AF_INET,SOCK_STREAM|SOCK_CLOEXEC,0),yes=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
     struct sockaddr_in sa={.sin_family=AF_INET,.sin_port=htons(24872),.sin_addr.s_addr=htonl(INADDR_ANY)};
     if(fd<0||bind(fd,(struct sockaddr*)&sa,sizeof(sa))<0||listen(fd,4)<0){perror("listen");return 1;}
-    pid_t children[4]={0};fprintf(stderr,"VGF native controller ready, protocol 2\n");
+    pid_t children[4]={0},supervisor=0;double supervisor_restart=0;fprintf(stderr,"VGF native controller ready, protocol 2\n");
     while(!stopping){
         for(int i=0;i<4;i++)if(children[i]&&waitpid(children[i],NULL,WNOHANG)>0)children[i]=0;
+        /* Cable control must not depend on the network: keep its owner alive. */
+        if(supervisor&&waitpid(supervisor,NULL,WNOHANG)>0){supervisor=0;supervisor_restart=now_s()+1;fputs("serial control supervisor exited; restarting in 1s\n",stderr);}
+        if(!supervisor&&now_s()>=supervisor_restart){supervisor=start_supervisor(fd,ctx);if(!supervisor)supervisor_restart=now_s()+1;}
         struct pollfd p={fd,POLLIN,0};int r=poll(&p,1,250);if(r<0&&errno!=EINTR)break;if(r<=0)continue;
         int c=accept4(fd,NULL,NULL,SOCK_CLOEXEC);if(c<0)continue;int slot=-1;for(int i=0;i<4;i++)if(!children[i]){slot=i;break;}if(slot<0){close(c);continue;}
         pid_t pid=fork();if(pid==0){close(fd);client(ctx,c);SSL_CTX_free(ctx);_exit(0);}close(c);if(pid>0)children[slot]=pid;
     }
-    close(fd);for(int i=0;i<4;i++)if(children[i])kill(children[i],SIGTERM);
-    double deadline=now_s()+5;for(int i=0;i<4;i++)if(children[i]){while(waitpid(children[i],NULL,WNOHANG)==0&&now_s()<deadline)usleep(10000);if(waitpid(children[i],NULL,WNOHANG)==0){kill(children[i],SIGKILL);waitpid(children[i],NULL,0);}}
+    close(fd);for(int i=0;i<4;i++)if(children[i])kill(children[i],SIGTERM);if(supervisor)kill(supervisor,SIGTERM);
+    double deadline=now_s()+5;for(int i=0;i<4;i++)if(children[i])reap(children[i],deadline);if(supervisor)reap(supervisor,deadline);
     SSL_CTX_free(ctx);munmap(failures,5*sizeof(double));return 0;
 }

@@ -144,8 +144,8 @@ WATCH
     cat > /etc/systemd/system/vgf-controller.service <<'UNIT'
 [Unit]
 Description=Video Game Filter controller service
-Wants=network-online.target bluetooth.service avahi-daemon.service vgf-usb-gadget.service
-After=network-online.target bluetooth.service avahi-daemon.service vgf-usb-gadget.service
+Wants=bluetooth.service avahi-daemon.service vgf-usb-gadget.service
+After=bluetooth.service avahi-daemon.service vgf-usb-gadget.service
 [Service]
 Type=simple
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
