@@ -14,6 +14,7 @@ check: test-protocol test-auth test-session test-serial
 	./test-session
 	./test-serial
 	sh ./test_usb_control.sh
+	sh ./test_net_watch.sh
 test-protocol: test_protocol.o protocol.o usb.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 test-auth: test_auth.o bluetooth.o protocol.o usb.o serial.o

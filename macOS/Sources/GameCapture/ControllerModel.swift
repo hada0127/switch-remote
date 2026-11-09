@@ -45,6 +45,23 @@ import AgentControlProtocol
     @Published private(set) var connected = false
     /// Raw backend reported with the last "connected" state ("usb" or a Bluetooth name).
     private(set) var backend: String?
+    /// FTDI cable present (`serialProbe`); lets the app reach the Pi without Wi-Fi or Bonjour.
+    @Published private(set) var serialCable = false
+    /// Control channel of the running session: "tls" or "serial", nil until the Pi answers.
+    @Published private(set) var controlLink: String?
+    private let serialProbe: () -> String?
+    private var serialPath: String?
+    private var serialProbeTimer: Timer?
+    /// Set after a link failure so the next attempt tries the other link.
+    private var preferSerial = false
+    private var viaSerial = false
+    /// Bonjour usually answers within a few seconds of discovery starting, so "not found" only
+    /// picks the cable after this grace; otherwise a healthy Wi-Fi start would go serial.
+    private let serialGrace: TimeInterval
+    private var serialGraceUntil: TimeInterval = 0
+    /// One-shot connect at the end of the grace; separate from `retry` so Bonjour can still connect TLS meanwhile.
+    private var bonjourGrace: Task<Void, Never>?
+    var serialSession: Bool { running && viaSerial }
     let liveInput = ControllerLiveInput()
     private var activity: NSObjectProtocol?
     private var bridge: ControllerSession?
@@ -53,13 +70,20 @@ import AgentControlProtocol
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var ids: [ObjectIdentifier: String] = [:]
-    var canConnect: Bool { foundPis.contains { $0.id == selectedPi } && deviceStore.devices.contains { $0.id == selectedPi } }
+    var canConnect: Bool { deviceStore.devices.contains { $0.id == selectedPi } && (foundPis.contains { $0.id == selectedPi } || serialCable) }
+    /// Pairing a new Switch needs the TLS session, so only a Pi visible over Bonjour qualifies.
+    var canPair: Bool { deviceStore.devices.contains { $0.id == selectedPi } && foundPis.contains { $0.id == selectedPi } }
     var hasSavedPi: Bool { !deviceStore.devices.isEmpty }
     func id(_ controller: GCController) -> String { ids[ObjectIdentifier(controller)] ?? "" }
 
-    init(startDiscovery: Bool = true, controllerProvider: @escaping () -> [GCController] = GCController.controllers, store: PiDeviceStore? = nil) {
+    /// `serialProbe` defaults to the FTDI lookup only when discovery runs, so tests never open the real cable.
+    init(startDiscovery: Bool = true, controllerProvider: @escaping () -> [GCController] = GCController.controllers, store: PiDeviceStore? = nil,
+         serialProbe: (() -> String?)? = nil, serialGrace: TimeInterval = 5) {
         self.deviceStore = store ?? PiDeviceStore()
+        self.serialGrace = serialGrace
         self.controllerProvider = controllerProvider
+        self.serialProbe = serialProbe ?? (startDiscovery ? SerialControllerTransport.devicePath : { nil })
+        serialPath = self.serialProbe(); serialCable = serialPath != nil
         positional = UserDefaults.standard.bool(forKey: "controller.positional")
         inputPipeline.setPositional(positional)
         status = "연결 안 됨"
@@ -78,7 +102,11 @@ import AgentControlProtocol
         })
         observers.append(NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self, inputPipeline] _ in
             inputPipeline.select(nil, remote: false)
-            Task { @MainActor in self?.disconnect(manual: false) }
+            // The process exits right after this; a deferred stop would never send BYE.
+            MainActor.assumeIsolated {
+                (self?.bridge as? PiControlBridge)?.stopNow()
+                self?.disconnect(manual: false)
+            }
         })
         if UserDefaults.standard.bool(forKey: "controller.moonlight") {
             selected = Self.moonlightID; allowAutomaticInput = false
@@ -89,18 +117,10 @@ import AgentControlProtocol
         refresh()
         automatic = UserDefaults.standard.object(forKey: "pi.automatic") as? Bool ?? true
         preferredPi = UserDefaults.standard.string(forKey: "pi.selected") ?? deviceStore.devices.first?.id ?? ""
+        // Discovery starts on the next main-loop turn; the grace counts from here.
+        serialGraceUntil = ProcessInfo.processInfo.systemUptime + serialGrace
         selectedPi = deviceStore.devices.first(where: { $0.id == preferredPi })?.id ?? deviceStore.devices.first?.id ?? ""
-        discovery.onChange = { [weak self] devices in
-            guard let self else { return }
-            self.foundPis = devices
-            if let active = self.activeEndpoint, let updated = devices.first(where: { $0.id == active.id }),
-               updated.host != active.host || updated.port != active.port {
-                self.disconnect(manual: false)
-            }
-            let available = devices.filter { d in self.deviceStore.devices.contains { $0.id == d.id } }
-            if let choice = Self.effectivePi(preferred: self.preferredPi, current: self.selectedPi, available: available.map(\.id)), choice != self.selectedPi { self.selectedPi = choice }
-            self.reconnectIfPossible()
-        }
+        discovery.onChange = { [weak self] devices in self?.discoveryChanged(devices) }
         discovery.onError = { [weak self] message in self?.detail = message }
         if startDiscovery { DispatchQueue.main.async { [weak self] in self?.discovery.start() } }
         // This timer is presentation only. Gameplay never waits for the UI loop.
@@ -112,8 +132,31 @@ import AgentControlProtocol
             }
         }
         timer = ticker; RunLoop.main.add(ticker, forMode: .common)
+        if startDiscovery {
+            let probe = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.updateSerialCable() }
+            }
+            serialProbeTimer = probe; RunLoop.main.add(probe, forMode: .common)
+        }
     }
-    deinit { timer?.invalidate(); inputPipeline.setSession(nil); observers.forEach(NotificationCenter.default.removeObserver); bridge?.stop() }
+    deinit { timer?.invalidate(); serialProbeTimer?.invalidate(); bonjourGrace?.cancel(); inputPipeline.setSession(nil); observers.forEach(NotificationCenter.default.removeObserver); bridge?.stop() }
+    /// Bonjour results. Internal for tests.
+    func discoveryChanged(_ devices: [DiscoveredPi]) {
+        foundPis = devices
+        if let active = activeEndpoint, let updated = devices.first(where: { $0.id == active.id }),
+           updated.host != active.host || updated.port != active.port {
+            disconnect(manual: false)
+        }
+        let available = devices.filter { d in deviceStore.devices.contains { $0.id == d.id } }
+        if let choice = Self.effectivePi(preferred: preferredPi, current: selectedPi, available: available.map(\.id)), choice != selectedPi { selectedPi = choice }
+        reconnectIfPossible()
+    }
+    func updateSerialCable() {
+        let was = serialCable
+        serialPath = serialProbe()
+        if serialCable != (serialPath != nil) { serialCable = serialPath != nil }
+        if !was && serialCable { reconnectIfPossible() }
+    }
     func refresh() {
         controllers = controllerProvider().filter { $0.extendedGamepad != nil }
         for c in controllers where ids[ObjectIdentifier(c)] == nil { ids[ObjectIdentifier(c)] = UUID().uuidString }
@@ -161,6 +204,10 @@ import AgentControlProtocol
         if available.contains(current) { return current }
         return available.first
     }
+    /// Bonjour-visible Pis use TLS unless the last TLS session lost its link; pairing always needs TLS.
+    nonisolated static func chooseSerial(endpointFound: Bool, serialAvailable: Bool, preferSerial: Bool, pair: Bool) -> Bool {
+        serialAvailable && !pair && (!endpointFound || preferSerial)
+    }
     static func shouldClearReconnectIntent(origin: UUID?, current: UUID, connected: Bool) -> Bool {
         connected && origin != nil && origin != current
     }
@@ -183,16 +230,27 @@ import AgentControlProtocol
     }
     func connect(pair: Bool = false) {
         if pair { pairingRequested = true; if running { disconnect(manual: false) } }
-        guard !running, let endpoint = foundPis.first(where: { $0.id == selectedPi }),
-              let device = deviceStore.devices.first(where: { $0.id == selectedPi }) else { return }
+        guard !running, let device = deviceStore.devices.first(where: { $0.id == selectedPi }) else { return }
+        let endpoint = foundPis.first(where: { $0.id == selectedPi })
+        serialPath = serialProbe(); serialCable = serialPath != nil
+        let useSerial = Self.chooseSerial(endpointFound: endpoint != nil, serialAvailable: serialPath != nil,
+                                          preferSerial: preferSerial, pair: pairingRequested)
+        // "Not on Bonjour" right after discovery starts usually means "not yet": wait before using the cable.
+        if useSerial && endpoint == nil && !preferSerial {
+            let wait = serialGraceUntil - ProcessInfo.processInfo.systemUptime
+            if wait > 0 { waitForBonjour(wait); return }
+        }
+        guard useSerial || endpoint != nil else { return }
         if UserDefaults.standard.string(forKey: "controller.source") == "none" { pendingSourceUSBAction = "detach" }
         retry?.cancel(); retry = nil
+        bonjourGrace?.cancel(); bonjourGrace = nil
         let token = UUID(); generation = token
-        let transport = PiControlBridge(); bridge = transport; activeEndpoint = endpoint
+        let transport = PiControlBridge(); bridge = transport; activeEndpoint = useSerial ? nil : endpoint
+        viaSerial = useSerial; controlLink = nil
         transport.onUSBState = { [weak self] value in Task { @MainActor in self?.receiveUSBState(value, from: token) } }
         activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Forward game controller input to Raspberry Pi")
-        logger.notice("Starting Pi connection")
-        running = true; connected = false; status = "파이에 자동 연결 중…"; detail = ""
+        logger.notice("Starting Pi connection via \(useSerial ? "serial" : "tls", privacy: .public)")
+        running = true; connected = false; status = useSerial ? "케이블로 파이에 연결 중…" : "파이에 자동 연결 중…"; detail = ""
         transport.onMessage = { [weak self] state, message in
             Task { @MainActor in
                 guard let self, self.generation == token else { return }
@@ -202,6 +260,7 @@ import AgentControlProtocol
                     if let message { self.logger.error("Pi connection detail: \(message, privacy: .public)") }
                 }
                 self.setLinkConnected(state == "connected", backend: message)
+                if !["error", "link-error", "waiting"].contains(state) { self.controlLink = self.viaSerial ? "serial" : "tls" }
                 if ["connected", "connecting", "reconnecting", "detached"].contains(state) {
                     self.piDetached = state == "detached"
                     if self.piDetached == true && self.sourceUSBRequestInFlight == "detach" { self.sourceUSBRequestInFlight = nil }
@@ -213,7 +272,8 @@ import AgentControlProtocol
                         self.reconnectAfterUSBAction = false; self.reconnectOrigin = nil
                     }
                 }
-                if state == "error" {
+                if state == "error" || state == "link-error" {
+                    if state == "link-error" { self.preferSerial = !self.viaSerial }
                     self.disconnect(manual: false); self.status = "다시 연결 대기 중"; self.detail = message ?? ""
                     if self.automatic || self.pairingRequested || self.reconnectAfterUSBAction {
                         self.retry = Task { @MainActor [weak self] in
@@ -223,14 +283,26 @@ import AgentControlProtocol
                         }
                     }
                 } else {
-                    self.status = state == "connected" ? "스위치 연결됨 · " + (message == "usb" ? "USB" : "Bluetooth") :
+                    self.status = state == "connected" ? "스위치 연결됨 · " + (message == "usb" ? "USB" : "Bluetooth") + (self.viaSerial ? " · 케이블 제어" : "") :
                         (state == "detached" ? (UserDefaults.standard.string(forKey: "controller.source") == "none" ? "USB 연결 해제됨 · 입력 사용 안 함" : "USB 연결 해제됨") :
                         (state == "enrolled" ? "파이 등록 완료" : "스위치 연결 대기 중…"))
                 }
             }
         }
-        transport.send(.neutral); transport.start(device: device, endpoint: endpoint, pair: pairingRequested)
+        transport.send(.neutral)
+        if useSerial, let serialPath { transport.startSerial(device: device, path: serialPath) }
+        else if let endpoint { transport.start(device: device, endpoint: endpoint, pair: pairingRequested) }
         inputPipeline.setSession(transport)
+    }
+    private func waitForBonjour(_ seconds: TimeInterval) {
+        guard bonjourGrace == nil else { return }
+        logger.notice("Pi not on Bonjour yet; cable control in \(seconds, format: .fixed(precision: 1), privacy: .public)s unless it appears")
+        bonjourGrace = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            guard let self else { return }
+            self.bonjourGrace = nil
+            if !self.running { self.connect() }
+        }
     }
     /// Any connected → not-connected transition drops the agent hold (neutral edge), so a
     /// reconnect on the same session can never resume an old agent input.
@@ -275,10 +347,11 @@ import AgentControlProtocol
     func disconnect(manual: Bool = true) {
         if manual { pairingRequested = false; reconnectAfterUSBAction = false; reconnectOrigin = nil; automatic = false }
         retry?.cancel(); retry = nil
+        bonjourGrace?.cancel(); bonjourGrace = nil
         generation = UUID(); inputPipeline.setSession(nil); bridge?.stop(); bridge = nil; activeEndpoint = nil
         lastRequestedUSBAction = nil; sourceUSBRequestInFlight = nil; piDetached = nil
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
-        running = false; connected = false; backend = nil; liveInput.value = .neutral; status = "연결 안 됨"
+        running = false; connected = false; backend = nil; controlLink = nil; liveInput.value = .neutral; status = "연결 안 됨"
         usbState = "unavailable"
     }
     func usbAction(_ action: String) -> Result<[String: Any], AgentError> {
@@ -309,7 +382,8 @@ import AgentControlProtocol
             "controller": ["source": source, "piRunning": running, "connected": connected,
                            "usbState": usbState,
                            "backend": connected ? (backend == "usb" ? "usb" : "bluetooth") : NSNull(),
-                           "transport": transport?.kind ?? NSNull()] as [String: Any],
+                           "transport": transport?.kind ?? NSNull(),
+                           "control": controlLink ?? NSNull()] as [String: Any],
             "metrics": ["forwardedChanges": metrics.forwardedChanges, "maxForwardDelayMs": metrics.maxForwardDelayMS, "rtt": rtt] as [String: Any],
             "agent": ["holdUntil": inputPipeline.agentHoldUntil ?? NSNull()] as [String: Any]
         ]
@@ -378,9 +452,9 @@ struct ControllerSettingsView: View {
             controllerSection("라즈베리파이 · 자동 연결") {
                 Toggle("네트워크에서 찾으면 자동 연결", isOn: $model.automatic).toggleStyle(.switch).frame(minHeight: 72)
                 ClassicPicker(title: "파이", selection: Binding(get: { model.selectedPi }, set: { model.selectPi($0) }),
-                              options: [("", "검색 중…")] + ((!model.selectedPi.isEmpty && !model.foundPis.contains(where: { $0.id == model.selectedPi })) ? [(model.selectedPi, "등록된 파이 · 오프라인")] : []) + model.foundPis.map { ($0.id, $0.name) }, enabled: !model.running)
+                              options: [("", "검색 중…")] + ((!model.selectedPi.isEmpty && !model.foundPis.contains(where: { $0.id == model.selectedPi })) ? [(model.selectedPi, model.serialSession ? "등록된 파이 · 케이블" : "등록된 파이 · 오프라인")] : []) + model.foundPis.map { ($0.id, $0.name) }, enabled: !model.running)
                     .frame(height: 72)
-                if model.foundPis.isEmpty { Text("같은 네트워크에서 파이를 찾고 있습니다.").font(AppFonts.font(22)).foregroundStyle(.secondary) }
+                if model.foundPis.isEmpty { Text("같은 네트워크에서 파이를 찾고 있습니다." + (model.serialCable ? " 케이블이 있으면 케이블로 연결합니다." : "")).font(AppFonts.font(22)).foregroundStyle(.secondary) }
                 HStack {
                     Button("USB 연결 해제") { _ = model.usbAction("detach") }.disabled(!model.running || model.usbState == "unavailable")
                     Button("USB 다시 연결") { _ = model.usbAction("attach") }.disabled(!model.running || model.usbState == "unavailable")
@@ -388,7 +462,7 @@ struct ControllerSettingsView: View {
                 HStack {
                     Button("파이 세션 연결") { model.connect() }.disabled(model.running || !model.canConnect)
                     Button("파이 세션 연결 해제") { model.disconnect() }.disabled(!model.running)
-                    Button("스위치 새로 페어링") { model.connect(pair: true) }.disabled(!model.canConnect)
+                    Button("스위치 새로 페어링") { model.connect(pair: true) }.disabled(!model.canPair)
                 }
                 Text(model.status)
                 Text(model.usbStatusText)

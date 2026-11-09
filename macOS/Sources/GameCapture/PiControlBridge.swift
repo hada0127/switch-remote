@@ -13,6 +13,7 @@ extension ControllerSession { func transportMetrics() -> TransportMetrics? { nil
 extension SSHControllerBridge: ControllerSession {}
 
 /// TLS authenticates and owns the session. Gameplay prefers local serial and falls back to UDP.
+/// Without TLS (`startSerial`), the cable carries both control frames and input.
 final class PiControlBridge: ControllerSession, @unchecked Sendable {
     private let queue = DispatchQueue(label: "net.tarucy.controller.network", qos: .userInteractive)
     private let lock = NSLock()
@@ -38,17 +39,30 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     private var hidConnected = false
     private var host = ""
     private var device: PairedPi?
+    /// Serial link mode: the cable is the control channel (no TLS, no UDP).
+    private var serialLink = false
+    private var serialReady = false
+    private let helloNonce = UInt32.random(in: 1...UInt32.max)
+    private var helloStarted = 0.0
+    private var lastHelloSent = -Double.infinity
+    private var usbCommandID: UInt32 = 0
+    private var usbPending: (id: UInt32, action: String, sent: Int, lastSent: Double)?
     var onMessage: (@Sendable (String, String?) -> Void)?
     var onUSBState: (@Sendable (String) -> Void)?
 
     func controlUSB(_ action: String) {
         queue.async { [self] in
-            guard Self.canControlUSB(active: active, hasAuthenticatedTransport: udp != nil), action == "detach" || action == "attach" else { return }
+            guard Self.canControlUSB(active: active, hasAuthenticatedTransport: udp != nil || serialReady), action == "detach" || action == "attach" else { return }
             if action == "detach" {
                 lock.lock(); pending.append(.neutral, at: ProcessInfo.processInfo.systemUptime); lock.unlock()
                 flush()
+                // The neutral state must reach the Pi before the USB command on the same cable.
+                if serialLink, let work = serialAxisWork { work.perform(); work.cancel() }
             }
-            write(["type": "usb", "action": action])
+            guard serialLink else { write(["type": "usb", "action": action]); return }
+            usbCommandID = usbCommandID == UInt32.max ? 1 : usbCommandID + 1
+            usbPending = (usbCommandID, action, 0, -Double.infinity)
+            sendUSBCommand()
         }
     }
     static func canControlUSB(active: Bool, hasAuthenticatedTransport: Bool) -> Bool {
@@ -69,7 +83,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     }
     func start(device: PairedPi, endpoint: DiscoveredPi, pair: Bool) {
         queue.async { [self] in
-            guard connection == nil, let port = NWEndpoint.Port(rawValue: UInt16(exactly: endpoint.port) ?? 0), endpoint.port > 0 else { return }
+            guard connection == nil, !serialLink, let port = NWEndpoint.Port(rawValue: UInt16(exactly: endpoint.port) ?? 0), endpoint.port > 0 else { return }
             self.device = device; host = endpoint.host; active = true
             lastReply = ProcessInfo.processInfo.systemUptime
             let tls = NWProtocolTLS.Options()
@@ -93,7 +107,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                     else if let pin = PiKeychain.read(device.id + ".pin") { request["pin"] = pin }
                     else { self.fail("저장된 등록 정보가 없습니다. SD 준비 정보를 다시 가져오세요."); return }
                     self.write(request); self.receive()
-                case .failed(let error): self.fail("파이 연결 실패: \(error.localizedDescription)")
+                case .failed(let error): self.linkFail("파이 연결 실패: \(error.localizedDescription)")
                 case .waiting(let error): self.onMessage?("waiting", "파이 네트워크 연결을 기다리는 중입니다. \(error.localizedDescription)")
                 default: break
                 }
@@ -102,7 +116,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
             timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
             timer.setEventHandler { [weak self] in
                 guard let self, self.active else { return }
-                if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) { self.fail("파이 응답이 없어 다시 연결합니다.") }
+                if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) { self.linkFail("파이 응답이 없어 다시 연결합니다.") }
             }
             self.timer = timer; timer.resume()
             let probe = DispatchSource.makeTimerSource(queue: queue)
@@ -112,11 +126,102 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
             connection.start(queue: queue)
         }
     }
+    /// Control over the GPIO UART alone, for when Wi-Fi or Bonjour is down.
+    func startSerial(device: PairedPi, path: String) {
+        queue.async { [self] in
+            guard !active, connection == nil, serial == nil else { return }
+            self.device = device; serialLink = true; serialReady = false; active = true; startup = true
+            let now = ProcessInfo.processInfo.systemUptime
+            lastReply = now; helloStarted = now
+            do {
+                serial = try SerialControllerTransport(path: path, queue: queue) { [weak self] in
+                    self?.linkFail("케이블 연결이 끊겼습니다.")
+                }
+            } catch { linkFail("케이블을 열 수 없습니다: \(error.localizedDescription)"); return }
+            serial?.onControl = { [weak self] type, body in self?.receiveControl(type, body) }
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
+            timer.setEventHandler { [weak self] in
+                guard let self, self.active, self.serialReady else { return }
+                if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) { self.linkFail("파이 응답이 없어 다시 연결합니다.") }
+            }
+            self.timer = timer; timer.resume()
+            let tick = DispatchSource.makeTimerSource(queue: queue)
+            tick.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20))
+            tick.setEventHandler { [weak self] in self?.serialTick() }
+            serialTimer = tick; tick.resume()
+            sendHello()
+        }
+    }
+    private func sendHello() {
+        guard active, let serial else { return }
+        lastHelloSent = ProcessInfo.processInfo.systemUptime
+        do { try serial.sendControl(type: SerialControl.hello, body: SerialControl.helloBody(nonce: helloNonce)) }
+        catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)") }
+    }
+    /// Resent every 250 ms, at most 4 times, until USB_RESULT, BYE or finish.
+    private func sendUSBCommand() {
+        guard active, serialReady, let serial, var command = usbPending else { return }
+        command.sent += 1; command.lastSent = ProcessInfo.processInfo.systemUptime
+        usbPending = command.sent >= 4 ? nil : command
+        do { try serial.sendControl(type: SerialControl.usb, body: SerialControl.usbBody(id: command.id, action: command.action)) }
+        catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)") }
+    }
+    private func serialTick() {
+        guard active, serialLink else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !serialReady {
+            if now - helloStarted >= 1.5 { linkFail("케이블로 파이 응답이 없습니다."); return }
+            if now - lastHelloSent >= 0.25 { sendHello() }
+            return
+        }
+        if let command = usbPending, now - command.lastSent >= 0.25 { sendUSBCommand() }
+    }
+    private func receiveControl(_ type: UInt8, _ body: [UInt8]) {
+        guard active, serialLink else { return }
+        switch type {
+        case SerialControl.helloReply:
+            guard !serialReady, let reply = SerialControl.helloReply(body), reply.nonce == helloNonce else { return }
+            lastReply = ProcessInfo.processInfo.systemUptime
+            switch reply.result {
+            case 0: break
+            case 1: fail("다른 컨트롤러 연결이 사용 중입니다."); return
+            case 2: fail("파이 등록 정보가 없습니다."); return
+            case 3: fail("파이 소프트웨어를 업데이트하세요."); return
+            default: fail("파이 연결 오류"); return
+            }
+            guard reply.version == SerialControl.version else { fail("파이 소프트웨어를 업데이트하세요."); return }
+            guard let device, UUID(uuidString: device.id) == reply.id else { fail("케이블에 연결된 파이가 선택한 파이와 다릅니다."); return }
+            serialReady = true; startup = true
+            flush()
+        case SerialControl.status:
+            guard serialReady, let status = SerialControl.status(body) else { return }
+            lastReply = ProcessInfo.processInfo.systemUptime
+            receiveStatus(status.state, backend: status.backend, usbState: status.usbState)
+        case SerialControl.usbResult:
+            guard serialReady, let result = SerialControl.usbResult(body) else { return }
+            lastReply = ProcessInfo.processInfo.systemUptime
+            if usbPending?.id == result.id { usbPending = nil }
+        case SerialControl.piBye:
+            guard let bye = SerialControl.piBye(body), bye.nonce == helloNonce else { return }
+            // The Pi already ended the session; do not answer with BYE.
+            serialReady = false; usbPending = nil
+            switch bye.reason {
+            case 2: linkFail("파이가 케이블 입력을 받지 못해 다시 연결합니다.")
+            case 3: fail("다른 케이블 연결이 세션을 가져갔습니다.")
+            case 4: fail("파이 블루투스를 시작할 수 없습니다.")
+            case 5: fail("파이 USB 명령이 실패했습니다.")
+            case 6: fail("파이 서비스가 종료되어 다시 연결합니다.")
+            default: fail("파이 연결이 종료되어 다시 연결합니다.")
+            }
+        default: return
+        }
+    }
     private func write(_ value: [String: Any]) {
         guard var data = try? JSONSerialization.data(withJSONObject: value) else { return }
         data.append(10)
         connection?.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error { self?.fail(error.localizedDescription) }
+            if let error { self?.linkFail(error.localizedDescription) }
         })
     }
     private func receive() {
@@ -124,7 +229,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
             guard let self, self.active else { return }
             if let data { self.parse(data) }
             guard self.active else { return }
-            if let error { self.fail(error.localizedDescription) }
+            if let error { self.linkFail(error.localizedDescription) }
             else if complete { self.fail("파이 연결이 종료되어 다시 연결합니다.") }
             else { self.receive() }
         }
@@ -152,18 +257,22 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                 catch { fail(error.localizedDescription); return }
             case "status":
                 guard let state = message["state"] as? String else { continue }
-                if let usbState = message["usbState"] as? String { onUSBState?(usbState) }
-                startup = state == "starting" || state == "waiting"
-                if state == "connected" && !hidConnected {
-                    serialRetrySeconds = 1; lastSerialAttempt = 0
-                    checkSerial()
-                }
-                hidConnected = state == "connected"
-                onMessage?(state, message["backend"] as? String)
+                receiveStatus(state, backend: message["backend"] as? String, usbState: message["usbState"] as? String)
             case "error": fail(message["message"] as? String ?? "파이 연결 오류"); return
             default: fail("지원하지 않는 파이 응답입니다."); return
             }
         }
+    }
+    /// Shared by the TLS `status` message and the serial STATUS frame.
+    private func receiveStatus(_ state: String, backend: String?, usbState: String?) {
+        if let usbState { onUSBState?(usbState) }
+        startup = state == "starting" || state == "waiting"
+        if state == "connected" && !hidConnected && !serialLink {
+            serialRetrySeconds = 1; lastSerialAttempt = 0
+            checkSerial()
+        }
+        hidConnected = state == "connected"
+        onMessage?(state, backend)
     }
     static func serialHealthy(openedAt: Double, lastAck: Double, now: Double) -> Bool {
         lastAck > 0 && now - lastAck < 0.1 && lastAck >= openedAt
@@ -178,7 +287,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         serialDeferred = nil; serialLast = nil
     }
     private func checkSerial() {
-        guard active, let udp else { return }
+        guard active, !serialLink, let udp else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let serial {
             if now - serial.openedAt > 0.15 && !Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: now) {
@@ -227,6 +336,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                         try serial.send(value, sequence: self.nextSequence())
                         self.serialLast = value; self.serialLastSent = ProcessInfo.processInfo.systemUptime
                     } catch {
+                        if self.serialLink { self.linkFail("케이블 쓰기 실패: \(error.localizedDescription)"); return }
                         self.serialRetrySeconds = min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2)
                         self.lastSerialAttempt = ProcessInfo.processInfo.systemUptime
                         self.dropSerial()
@@ -244,6 +354,16 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         return true
     }
     private func flush() {
+        if serialLink {
+            guard active, serialReady, serial != nil else { return }
+            lock.lock(); let values = pending.drain(at: ProcessInfo.processInfo.systemUptime); lock.unlock()
+            for value in values {
+                guard active else { break }
+                latest = value
+                do { _ = try sendSerial(value) } catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)"); return }
+            }
+            return
+        }
         guard active, let udp else { return }
         lock.lock(); let values = pending.drain(at: ProcessInfo.processInfo.systemUptime); lock.unlock()
         for value in values {
@@ -265,27 +385,44 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                     dropSerial()
                 }
             }
-            do { try udp.send(value, sequence: shared) } catch { fail(error.localizedDescription) }
+            do { try udp.send(value, sequence: shared) } catch { linkFail(error.localizedDescription) }
         }
     }
     private func fail(_ message: String) {
         guard active else { return }
         onMessage?("error", message); finish()
     }
+    /// The link itself failed (network, cable or liveness), so the next attempt may try the other link.
+    private func linkFail(_ message: String) {
+        guard active else { return }
+        onMessage?("link-error", message); finish()
+    }
     private func finish() {
         active = false; hidConnected = false
         let neutralSequence = nextSequence()
-        try? serial?.send(.neutral, sequence: neutralSequence)
-        try? udp?.send(ControllerInput.neutral, sequence: neutralSequence)
+        if serialLink {
+            if serialReady {
+                try? serial?.send(.neutral, sequence: neutralSequence)
+                try? serial?.sendControl(type: SerialControl.bye, body: SerialControl.byeBody(nonce: helloNonce))
+                serial?.drain(within: 0.2)
+            }
+        } else {
+            try? serial?.send(.neutral, sequence: neutralSequence)
+            try? udp?.send(ControllerInput.neutral, sequence: neutralSequence)
+        }
+        serialReady = false; usbPending = nil
         udp = nil; dropSerial(); serialTimer?.cancel(); serialTimer = nil; timer?.cancel(); timer = nil
         connection?.stateUpdateHandler = nil; connection?.cancel(); connection = nil
         buffer = Data()
     }
     func stop() { queue.async { [self] in finish() } }
+    /// Writes the closing frames before returning (app termination). Never call from `queue`.
+    func stopNow() { queue.sync { [self] in finish() } }
     /// Never call from `queue`.
     func transportMetrics() -> TransportMetrics? {
         queue.sync {
             guard active else { return nil }
+            if serialLink { return serial?.metrics }
             if let serial, Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: ProcessInfo.processInfo.systemUptime) { return serial.metrics }
             if let udp { return udp.metrics }
             return connection == nil ? nil : TransportMetrics(kind: "tls", rtt: nil)

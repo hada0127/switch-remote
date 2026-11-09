@@ -14,13 +14,24 @@ void vgf_serial_frame(uint64_t seq,const vgf_input *v,uint8_t out[VGF_SERIAL_INP
     for(int i=0;i<4;i++){uint16_t axis=(uint16_t)v->axis[i];out[19+i*2]=(uint8_t)axis;out[20+i*2]=(uint8_t)(axis>>8);}
     uint16_t crc=vgf_serial_crc(out+2,25);out[27]=(uint8_t)crc;out[28]=(uint8_t)(crc>>8);
 }
-int vgf_serial_byte(vgf_serial_parser *s,uint8_t b,vgf_input *out,uint64_t *seq){
+int vgf_serial_byte(vgf_serial_parser *s,uint8_t b,vgf_input *out,uint64_t *seq,vgf_serial_control *control){
     if(!s->used){if(b==0xa5)s->bytes[s->used++]=b;return 0;}
     if(s->used==1){if(b==0x5a)s->bytes[s->used++]=b;else s->used=b==0xa5?1:0;return 0;}
     s->bytes[s->used++]=b;
-    if(s->used==3&&b!=24){s->used=b==0xa5?1:0;return -1;}
-    if(s->used<VGF_SERIAL_INPUT)return 0;
-    s->used=0;uint16_t crc=vgf_serial_crc(s->bytes+2,25);
+    if(s->used==3){
+        if(b==24)s->need=VGF_SERIAL_INPUT;else if(b==VGF_SERIAL_CONTROL_LEN)s->need=VGF_SERIAL_CONTROL;
+        else {s->used=b==0xa5?1:0;return -1;}
+    }
+    if(s->used<s->need)return 0;
+    s->used=0;
+    if(s->need==VGF_SERIAL_CONTROL){
+        uint16_t crc=vgf_serial_crc(s->bytes+2,27);
+        if(s->bytes[29]!=(uint8_t)crc||s->bytes[30]!=(uint8_t)(crc>>8))return -1;
+        /* Control frames never touch the input sequence. */
+        if(!control)return 0;
+        control->type=s->bytes[3];memcpy(control->body,s->bytes+4,VGF_SERIAL_BODY);return 2;
+    }
+    uint16_t crc=vgf_serial_crc(s->bytes+2,25);
     if(s->bytes[27]!=(uint8_t)crc||s->bytes[28]!=(uint8_t)(crc>>8)||memcmp(s->bytes+11,"VGF2",4))return -1;
     uint64_t number=0;for(int i=3;i<11;i++)number=(number<<8)|s->bytes[i];
     uint32_t buttons=0;for(int i=0;i<4;i++)buttons|=(uint32_t)s->bytes[15+i]<<(8*i);
@@ -31,6 +42,11 @@ int vgf_serial_byte(vgf_serial_parser *s,uint8_t b,vgf_input *out,uint64_t *seq)
 void vgf_serial_ack(uint64_t seq,uint8_t out[VGF_SERIAL_ACK]){
     out[0]=0xa5;out[1]=0x5a;out[2]=8;sequence_bytes(seq,out+3);
     uint16_t crc=vgf_serial_crc(out+2,9);out[11]=(uint8_t)crc;out[12]=(uint8_t)(crc>>8);
+}
+void vgf_serial_control_frame(uint8_t type,const uint8_t body[VGF_SERIAL_BODY],uint8_t out[VGF_SERIAL_CONTROL]){
+    out[0]=0xa5;out[1]=0x5a;out[2]=VGF_SERIAL_CONTROL_LEN;out[3]=type;
+    if(body)memcpy(out+4,body,VGF_SERIAL_BODY);else memset(out+4,0,VGF_SERIAL_BODY);
+    uint16_t crc=vgf_serial_crc(out+2,27);out[29]=(uint8_t)crc;out[30]=(uint8_t)(crc>>8);
 }
 int vgf_serial_open(const char *path){
     int fd=open(path,O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC);if(fd<0)return -1;
