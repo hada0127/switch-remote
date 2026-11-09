@@ -121,6 +121,58 @@ final class SerialControlTests: XCTestCase {
         XCTAssertFalse(none.canPair)
     }
 
+    @MainActor private func cableModel(_ store: PiDeviceStore, path: String, grace: TimeInterval) -> ControllerModel {
+        ControllerModel(startDiscovery: false, controllerProvider: { [] }, store: store, serialProbe: { path }, serialGrace: grace)
+    }
+    @MainActor private func waitMain(_ timeout: Double, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline { if condition() { return true }; try? await Task.sleep(for: .milliseconds(10)) }
+        return condition()
+    }
+
+    // B1: a healthy Wi-Fi start must not pick the cable just because Bonjour has not answered yet.
+    @MainActor func testAutoConnectWaitsForBonjourBeforeCable() async throws {
+        let pi = try makePty()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let saved = UserDefaults.standard.object(forKey: "pi.automatic")
+        UserDefaults.standard.set(true, forKey: "pi.automatic")
+        defer { if let saved { UserDefaults.standard.set(saved, forKey: "pi.automatic") } else { UserDefaults.standard.removeObject(forKey: "pi.automatic") } }
+        let store = PiDeviceStore(directory: root, credentialSave: { _, _ in true })
+        let enrollment = ["id": goldenID, "name": "pi", "fingerprint": String(repeating: "a", count: 64),
+                          "client": UUID().uuidString, "pin": "123456"]
+        try store.enroll(JSONSerialization.data(withJSONObject: enrollment))
+
+        // Cable present, Bonjour silent: nothing at start, the cable after the grace.
+        let late = cableModel(store, path: pi.path, grace: 0.3)
+        XCTAssertTrue(late.automatic); XCTAssertTrue(late.canConnect)
+        XCTAssertFalse(late.running, "picked the cable before Bonjour had a chance")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(late.running)
+        let serialStarted = await waitMain(2) { late.serialSession }
+        XCTAssertTrue(serialStarted, "cable not used after the grace")
+        XCTAssertNotNil(pi.nextControl(SerialControl.hello, timeout: 1), "no HELLO after the grace")
+        late.disconnect()
+        UserDefaults.standard.set(true, forKey: "pi.automatic")
+
+        // Bonjour answers during the grace: TLS right away, and the grace end does not switch to the cable.
+        let early = cableModel(store, path: pi.path, grace: 0.3)
+        XCTAssertFalse(early.running)
+        early.discoveryChanged([DiscoveredPi(id: goldenID, name: "pi", host: "127.0.0.1", port: 9)])
+        XCTAssertTrue(early.running); XCTAssertFalse(early.serialSession)
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertFalse(early.serialSession, "grace end switched a TLS start to the cable")
+        early.disconnect()
+        UserDefaults.standard.set(true, forKey: "pi.automatic")
+
+        // A manual disconnect during the grace cancels the pending cable connect.
+        let cancelled = cableModel(store, path: pi.path, grace: 0.3)
+        XCTAssertFalse(cancelled.running)
+        cancelled.disconnect()
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertFalse(cancelled.running, "pending cable connect survived a manual disconnect")
+    }
+
     // MARK: pty bridge (the test plays the Pi on the pty master)
 
     private func makePty() throws -> PtyPi {
@@ -177,6 +229,29 @@ final class SerialControlTests: XCTestCase {
         let bye = try XCTUnwrap(pi.nextControl(SerialControl.bye, timeout: 1), "no BYE on stop")
         XCTAssertEqual(SerialControl.readBigEndian(bye, at: 0), nonce)
         XCTAssertFalse(recorder.contains("link-error", nil) || recorder.contains("error", nil))
+    }
+
+    // Pi BYE reason 2 (cable input lost) retries on the other link; reason 1 (session end) does not.
+    func testPtySerialPiByeReasons() throws {
+        for (reason, expected) in [(UInt8(2), "link-error"), (UInt8(1), "error")] {
+            let pi = try makePty()
+            let recorder = BridgeRecorder()
+            let bridge = PiControlBridge()
+            bridge.onMessage = { state, message in recorder.message(state, message) }
+            bridge.startSerial(device: device(), path: pi.path)
+            let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1), "no HELLO")
+            let nonce = SerialControl.readBigEndian(hello, at: 1)
+            pi.write(SerialFrame.make(control: SerialControl.helloReply, body: [1, 0] + SerialControl.bigEndian(nonce) + goldenIDBytes))
+            pi.write(SerialFrame.make(control: SerialControl.status, body: [3, 1] + Array("configured".utf8)))
+            XCTAssertTrue(wait(2) { recorder.contains("connected", "usb") }, "messages: \(recorder.messages)")
+            // A BYE for another session is ignored.
+            pi.write(SerialFrame.make(control: SerialControl.piBye, body: SerialControl.bigEndian(nonce &+ 1) + [reason]))
+            pi.write(SerialFrame.make(control: SerialControl.piBye, body: SerialControl.bigEndian(nonce) + [reason]))
+            XCTAssertTrue(wait(1) { recorder.contains(expected, nil) }, "reason \(reason): \(recorder.messages)")
+            XCTAssertFalse(recorder.contains(expected == "error" ? "link-error" : "error", nil), "reason \(reason): \(recorder.messages)")
+            XCTAssertNil(pi.nextControl(SerialControl.bye, timeout: 0.3), "Mac answered a Pi BYE")
+            bridge.stop()
+        }
     }
 
     func testPtySerialHelloTimeoutIsLinkError() throws {

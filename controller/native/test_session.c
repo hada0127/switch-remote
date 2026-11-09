@@ -362,12 +362,16 @@ static void serial_control_session_flow(void){
 }
 /* (b) A held controller lock answers HELLO_REPLY busy and starts nothing. */
 static void serial_control_busy(void){
-    int wire[2];serial_wire(wire);int held=open(test_lock,O_RDWR);assert(held>=0&&flock(held,LOCK_EX)==0);
+    int wire[2],err[2];serial_wire(wire);assert(pipe(err)==0);int held=open(test_lock,O_RDWR);assert(held>=0&&flock(held,LOCK_EX)==0);
     pid_t child=fork();assert(child>=0);
-    if(!child){alarm(3);close(wire[1]);close(held);session(NULL,-1,0,wire[0],5,test_id);_exit(0);}
-    close(wire[0]);uint8_t b[VGF_SERIAL_BODY];uint64_t ack;
+    if(!child){alarm(3);close(wire[1]);close(held);close(err[0]);dup2(err[1],2);close(err[1]);session(NULL,-1,0,wire[0],5,test_id);_exit(0);}
+    close(wire[0]);close(err[1]);uint8_t b[VGF_SERIAL_BODY];uint64_t ack;
     assert(pi_frame(wire[1],-1,b,&ack,1)==VGF_SERIAL_HELLO_REPLY&&b[1]==VGF_SERIAL_HELLO_BUSY&&get32(b+2)==5);
     wait_child(child);assert(pi_frame(wire[1],-1,b,&ack,.1)<0);close(held);close(wire[1]);
+    /* No session started, so no session end line. */
+    char log[4096];size_t used=0;ssize_t n;
+    while(used<sizeof log-1&&(n=read(err[0],log+used,sizeof log-1-used))>0)used+=(size_t)n;
+    log[used]=0;close(err[0]);assert(!strstr(log,"session end"));
 }
 /* (c) No Mac frame for the peer timeout ends with BYE(2). */
 static void serial_control_peer_timeout(void){

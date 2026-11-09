@@ -172,13 +172,14 @@ static void session(SSL *ssl,int tcp,int pair,int uart,uint32_t nonce,const uint
     int lock=lock_file(VGF_SESSION_LOCK),serial_lock=-1,udp=-1,serial=serial_mode?uart:-1;
     vgf_bt bt={.ctrl=-1,.itr=-1,.listen_ctrl=-1,.listen_itr=-1};vgf_queue queue={0};vgf_protocol protocol={0};unsigned char key[32]={0};
     uint64_t sequence=0,accepted=0,serial_accepted=0,serial_invalid=0,invalid=0,reports=0,blocked=0,udp_gaps=0;double max_gap=0,last_sent=0,max_udp_gap=0,last_udp=0;int connected=0,use_usb=0,listening=0,detached=access("/run/vgf-usb-manual-detach",F_OK)==0;vgf_serial_parser serial_parser={0};uint64_t serial_ack_sequence=0;
-    int reason=VGF_SERIAL_BYE_ENDED,send_bye=0;uint32_t last_usb_id=0;uint8_t last_usb_result=VGF_SERIAL_USB_ACCEPTED;
+    int reason=VGF_SERIAL_BYE_ENDED,send_bye=0,began=0;uint32_t last_usb_id=0;uint8_t last_usb_result=VGF_SERIAL_USB_ACCEPTED;
     /* The serial supervisor briefly probes S every 50ms; a TLS login retries past that. */
     if(lock<0||try_lock(lock,serial_mode?1:11,10)){
         if(serial_mode)serial_hello_reply(serial,VGF_SERIAL_HELLO_BUSY,nonce,device_id);
         else send_blocking(ssl,"{\"type\":\"error\",\"message\":\"다른 컨트롤러 연결이 사용 중입니다.\"}\n");
         goto done;
     }
+    began=1;
     if(serial_mode){
         serial_hello_reply(serial,VGF_SERIAL_HELLO_OK,nonce,device_id);send_bye=1;
         fputs("serial control session started\n",stderr);
@@ -364,7 +365,8 @@ static void session(SSL *ssl,int tcp,int pair,int uart,uint32_t nonce,const uint
  done:
     if(connected&&bt.itr>=0)hid_release(bt.itr,use_usb,&protocol);
     if(serial_mode&&send_bye)serial_bye(serial,nonce,(uint8_t)reason);
-    fprintf(stderr,"session end: input=%llu invalid=%llu reports=%llu blocked=%llu max_report_gap_ms=%.2f dropped_edges=%llu max_udp_gap_ms=%.2f udp_gaps_over_40ms=%llu serial_input=%llu serial_invalid=%llu link=%s\n",(unsigned long long)accepted,(unsigned long long)invalid,(unsigned long long)reports,(unsigned long long)blocked,max_gap*1000,(unsigned long long)queue.discarded,max_udp_gap*1000,(unsigned long long)udp_gaps,(unsigned long long)serial_accepted,(unsigned long long)serial_invalid,serial_mode?"serial":"tls");
+    /* A busy cable HELLO started no session, so it gets no session end line. */
+    if(began||!serial_mode)fprintf(stderr,"session end: input=%llu invalid=%llu reports=%llu blocked=%llu max_report_gap_ms=%.2f dropped_edges=%llu max_udp_gap_ms=%.2f udp_gaps_over_40ms=%llu serial_input=%llu serial_invalid=%llu link=%s\n",(unsigned long long)accepted,(unsigned long long)invalid,(unsigned long long)reports,(unsigned long long)blocked,max_gap*1000,(unsigned long long)queue.discarded,max_udp_gap*1000,(unsigned long long)udp_gaps,(unsigned long long)serial_accepted,(unsigned long long)serial_invalid,serial_mode?"serial":"tls");
     vgf_bt_close(&bt);if(udp>=0)close(udp);OPENSSL_cleanse(key,32);
     /* A cable-control uart belongs to the supervisor; a TLS session returns U after closing the uart. */
     if(!serial_mode&&serial>=0)close(serial);

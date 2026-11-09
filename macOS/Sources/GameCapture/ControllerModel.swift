@@ -55,6 +55,12 @@ import AgentControlProtocol
     /// Set after a link failure so the next attempt tries the other link.
     private var preferSerial = false
     private var viaSerial = false
+    /// Bonjour usually answers within a few seconds of discovery starting, so "not found" only
+    /// picks the cable after this grace; otherwise a healthy Wi-Fi start would go serial.
+    private let serialGrace: TimeInterval
+    private var serialGraceUntil: TimeInterval = 0
+    /// One-shot connect at the end of the grace; separate from `retry` so Bonjour can still connect TLS meanwhile.
+    private var bonjourGrace: Task<Void, Never>?
     var serialSession: Bool { running && viaSerial }
     let liveInput = ControllerLiveInput()
     private var activity: NSObjectProtocol?
@@ -72,8 +78,9 @@ import AgentControlProtocol
 
     /// `serialProbe` defaults to the FTDI lookup only when discovery runs, so tests never open the real cable.
     init(startDiscovery: Bool = true, controllerProvider: @escaping () -> [GCController] = GCController.controllers, store: PiDeviceStore? = nil,
-         serialProbe: (() -> String?)? = nil) {
+         serialProbe: (() -> String?)? = nil, serialGrace: TimeInterval = 5) {
         self.deviceStore = store ?? PiDeviceStore()
+        self.serialGrace = serialGrace
         self.controllerProvider = controllerProvider
         self.serialProbe = serialProbe ?? (startDiscovery ? SerialControllerTransport.devicePath : { nil })
         serialPath = self.serialProbe(); serialCable = serialPath != nil
@@ -106,18 +113,10 @@ import AgentControlProtocol
         refresh()
         automatic = UserDefaults.standard.object(forKey: "pi.automatic") as? Bool ?? true
         preferredPi = UserDefaults.standard.string(forKey: "pi.selected") ?? deviceStore.devices.first?.id ?? ""
+        // Discovery starts on the next main-loop turn; the grace counts from here.
+        serialGraceUntil = ProcessInfo.processInfo.systemUptime + serialGrace
         selectedPi = deviceStore.devices.first(where: { $0.id == preferredPi })?.id ?? deviceStore.devices.first?.id ?? ""
-        discovery.onChange = { [weak self] devices in
-            guard let self else { return }
-            self.foundPis = devices
-            if let active = self.activeEndpoint, let updated = devices.first(where: { $0.id == active.id }),
-               updated.host != active.host || updated.port != active.port {
-                self.disconnect(manual: false)
-            }
-            let available = devices.filter { d in self.deviceStore.devices.contains { $0.id == d.id } }
-            if let choice = Self.effectivePi(preferred: self.preferredPi, current: self.selectedPi, available: available.map(\.id)), choice != self.selectedPi { self.selectedPi = choice }
-            self.reconnectIfPossible()
-        }
+        discovery.onChange = { [weak self] devices in self?.discoveryChanged(devices) }
         discovery.onError = { [weak self] message in self?.detail = message }
         if startDiscovery { DispatchQueue.main.async { [weak self] in self?.discovery.start() } }
         // This timer is presentation only. Gameplay never waits for the UI loop.
@@ -136,7 +135,18 @@ import AgentControlProtocol
             serialProbeTimer = probe; RunLoop.main.add(probe, forMode: .common)
         }
     }
-    deinit { timer?.invalidate(); serialProbeTimer?.invalidate(); inputPipeline.setSession(nil); observers.forEach(NotificationCenter.default.removeObserver); bridge?.stop() }
+    deinit { timer?.invalidate(); serialProbeTimer?.invalidate(); bonjourGrace?.cancel(); inputPipeline.setSession(nil); observers.forEach(NotificationCenter.default.removeObserver); bridge?.stop() }
+    /// Bonjour results. Internal for tests.
+    func discoveryChanged(_ devices: [DiscoveredPi]) {
+        foundPis = devices
+        if let active = activeEndpoint, let updated = devices.first(where: { $0.id == active.id }),
+           updated.host != active.host || updated.port != active.port {
+            disconnect(manual: false)
+        }
+        let available = devices.filter { d in deviceStore.devices.contains { $0.id == d.id } }
+        if let choice = Self.effectivePi(preferred: preferredPi, current: selectedPi, available: available.map(\.id)), choice != selectedPi { selectedPi = choice }
+        reconnectIfPossible()
+    }
     func updateSerialCable() {
         let was = serialCable
         serialPath = serialProbe()
@@ -221,9 +231,15 @@ import AgentControlProtocol
         serialPath = serialProbe(); serialCable = serialPath != nil
         let useSerial = Self.chooseSerial(endpointFound: endpoint != nil, serialAvailable: serialPath != nil,
                                           preferSerial: preferSerial, pair: pairingRequested)
+        // "Not on Bonjour" right after discovery starts usually means "not yet": wait before using the cable.
+        if useSerial && endpoint == nil && !preferSerial {
+            let wait = serialGraceUntil - ProcessInfo.processInfo.systemUptime
+            if wait > 0 { waitForBonjour(wait); return }
+        }
         guard useSerial || endpoint != nil else { return }
         if UserDefaults.standard.string(forKey: "controller.source") == "none" { pendingSourceUSBAction = "detach" }
         retry?.cancel(); retry = nil
+        bonjourGrace?.cancel(); bonjourGrace = nil
         let token = UUID(); generation = token
         let transport = PiControlBridge(); bridge = transport; activeEndpoint = useSerial ? nil : endpoint
         viaSerial = useSerial; controlLink = nil
@@ -274,6 +290,16 @@ import AgentControlProtocol
         else if let endpoint { transport.start(device: device, endpoint: endpoint, pair: pairingRequested) }
         inputPipeline.setSession(transport)
     }
+    private func waitForBonjour(_ seconds: TimeInterval) {
+        guard bonjourGrace == nil else { return }
+        logger.notice("Pi not on Bonjour yet; cable control in \(seconds, format: .fixed(precision: 1), privacy: .public)s unless it appears")
+        bonjourGrace = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            guard let self else { return }
+            self.bonjourGrace = nil
+            if !self.running { self.connect() }
+        }
+    }
     /// Any connected → not-connected transition drops the agent hold (neutral edge), so a
     /// reconnect on the same session can never resume an old agent input.
     func setLinkConnected(_ value: Bool, backend: String?) {
@@ -317,6 +343,7 @@ import AgentControlProtocol
     func disconnect(manual: Bool = true) {
         if manual { pairingRequested = false; reconnectAfterUSBAction = false; reconnectOrigin = nil; automatic = false }
         retry?.cancel(); retry = nil
+        bonjourGrace?.cancel(); bonjourGrace = nil
         generation = UUID(); inputPipeline.setSession(nil); bridge?.stop(); bridge = nil; activeEndpoint = nil
         lastRequestedUSBAction = nil; sourceUSBRequestInFlight = nil; piDetached = nil
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }

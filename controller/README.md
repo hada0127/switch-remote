@@ -24,7 +24,7 @@ The GPIO mini UART uses a fixed 250 MHz core clock to keep 115200 stable. This l
 
 ### Cable control without Wi-Fi
 
-The app chooses the control path for each connection. It uses TLS when the selected Pi is visible on Bonjour. It uses the cable when the Pi is not found and an FTDI cable is present, or when the last TLS session ended by link failure (connection failure, read/write error, reply timeout). After a cable session ends by link failure, the next attempt prefers TLS again. Failed attempts retry after 5 seconds. **스위치 새로 페어링** requires the Pi on Bonjour and never uses the cable. `switchctl status` reports the active path as `controller.control` (`tls`, `serial`, or `null` until the Pi answers), and the connected status text adds " · 케이블 제어".
+The app chooses the control path for each connection. It uses TLS when the selected Pi is visible on Bonjour. It uses the cable when the Pi is still not found on Bonjour 5 seconds after the app starts looking and an FTDI cable is present (so a healthy Wi-Fi start never goes to the cable just because Bonjour has not answered yet), or when the last TLS session ended by link failure (connection failure, read/write error, reply timeout). After a cable session ends by link failure, the next attempt prefers TLS again. Failed attempts retry after 5 seconds. **스위치 새로 페어링** requires the Pi on Bonjour and never uses the cable. `switchctl status` reports the active path as `controller.control` (`tls`, `serial`, or `null` until the Pi answers), and the connected status text adds " · 케이블 제어".
 
 Control frames share the `a5 5a` header and CRC with input frames but use length 26: type (1), body (25, unused bytes zero), CRC over length through body. Unknown types are ignored; the 24-byte input and 8-byte acknowledgment frames are unchanged.
 
@@ -78,7 +78,7 @@ On the Pi, run `make -C controller/native check` for native protocol/enrollment 
 
 최초 설치에는 인터넷이 필요하고 몇 분 걸릴 수 있습니다. 맥에서 로컬 네트워크 접근 권한을 허용해주세요. 스위치와 처음 페어링할 때만 **컨트롤러 → 잡는 방법/순서 변경** 화면을 열면 됩니다. 버튼 입력은 연결된 UART 케이블을 우선 사용하고 케이블이 없으면 UDP로 전달하며, 입력이 끊기면 자동으로 버튼을 놓습니다. 스위치 2 슬립 깨우기·진동·자이로는 지원하지 않습니다.
 
-Wi-Fi나 Bonjour가 안 될 때는 케이블로 제어까지 합니다. 파이가 Bonjour에 보이면 TLS를, 안 보이는데 케이블이 있거나 직전 TLS 연결이 링크 장애로 끊겼으면 케이블을 씁니다. TLS 연결 중에 케이블 HELLO가 오면 파이는 TLS 세션을 끝내고 케이블 세션으로 넘겨받습니다. `switchctl status`의 `controller.control`이 `tls`/`serial`을 알려주고, 파이 저널에는 `serial control …` 줄과 `session end … link=tls|serial`이 남습니다. 서비스는 더 이상 `network-online`을 기다리지 않으며, 컨트롤러 세션이 있는 동안 `vgf-net-watch`는 재부팅을 건너뜁니다(Wi-Fi 재시작은 그대로). 첫 설치·등록(PIN 페어링)·스위치 블루투스 새 페어링에는 여전히 Wi-Fi가 필요합니다. 케이블이나 GPIO 8/10번 핀에 물리적으로 접근할 수 있으면 TLS 자격 없이 입력과 USB 해제/재연결이 가능합니다. 파이나 SD 카드에 물리적으로 접근하는 것과 같은 신뢰 수준입니다.
+Wi-Fi나 Bonjour가 안 될 때는 케이블로 제어까지 합니다. 파이가 Bonjour에 보이면 TLS를, 앱이 찾기 시작하고 5초가 지나도 안 보이는데 케이블이 있거나 직전 TLS 연결이 링크 장애로 끊겼으면 케이블을 씁니다. TLS 연결 중에 케이블 HELLO가 오면 파이는 TLS 세션을 끝내고 케이블 세션으로 넘겨받습니다. `switchctl status`의 `controller.control`이 `tls`/`serial`을 알려주고, 파이 저널에는 `serial control …` 줄과 `session end … link=tls|serial`이 남습니다. 서비스는 더 이상 `network-online`을 기다리지 않으며, 컨트롤러 세션이 있는 동안 `vgf-net-watch`는 재부팅을 건너뜁니다(Wi-Fi 재시작은 그대로). 첫 설치·등록(PIN 페어링)·스위치 블루투스 새 페어링에는 여전히 Wi-Fi가 필요합니다. 케이블이나 GPIO 8/10번 핀에 물리적으로 접근할 수 있으면 TLS 자격 없이 입력과 USB 해제/재연결이 가능합니다. 파이나 SD 카드에 물리적으로 접근하는 것과 같은 신뢰 수준입니다.
 
 ## Moonlight on iPhone (development)
 
