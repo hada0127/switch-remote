@@ -404,6 +404,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
             if serialReady {
                 try? serial?.send(.neutral, sequence: neutralSequence)
                 try? serial?.sendControl(type: SerialControl.bye, body: SerialControl.byeBody(nonce: helloNonce))
+                serial?.drain(within: 0.2)
             }
         } else {
             try? serial?.send(.neutral, sequence: neutralSequence)

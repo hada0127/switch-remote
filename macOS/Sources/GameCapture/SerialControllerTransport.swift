@@ -200,6 +200,13 @@ final class SerialControllerTransport {
         let count = bytes.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
         guard count == bytes.count else { throw POSIXError(.EIO) }
     }
+    /// Waits up to `seconds` for written bytes to leave the adapter: closing a non-blocking tty
+    /// discards them. tcdrain alone would block forever if the other end stops reading.
+    func drain(within seconds: Double) {
+        let fd = descriptor, done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { _ = tcdrain(fd); done.signal() }
+        _ = done.wait(timeout: .now() + seconds)
+    }
     private func readAcks() {
         var chunk = [UInt8](repeating: 0, count: 128)
         let n = Darwin.read(descriptor, &chunk, chunk.count)
