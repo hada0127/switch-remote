@@ -58,7 +58,7 @@ The Pi sends your Mac controller's input to the Switch. USB from the Pi to the d
 4. Give the first boot a few minutes and allow local network access on the Mac. The Pi needs internet access for its first setup. Keep the Mac and Pi on the same network.
 5. Connect a gamepad to the Mac and select it under **입력 장치**. Leave automatic connection enabled to reconnect to the saved Pi later.
 
-If A/B and X/Y feel reversed, turn on **A/B · X/Y 맞바꾸기**. Local controllers send input while the Mac app is active. HOME, Capture, and L+R are available above every settings tab.
+If A/B and X/Y feel reversed, turn on **A/B · X/Y 맞바꾸기**. Local controllers send input while the Mac app is active. Above every settings tab, HOME and L+R send controller input, Capture saves the latest raw capture-card frame as a full-resolution PNG in Downloads, and the sound button toggles mute.
 
 For first-time Bluetooth pairing, open **Controllers → Change Grip/Order** on the Switch. For USB setup details or troubleshooting, see the [Pi guide](controller/README.md).
 

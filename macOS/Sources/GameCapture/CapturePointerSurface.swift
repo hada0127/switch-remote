@@ -31,13 +31,14 @@ final class CapturePointerView: NSView {
 /// Large targets for a desktop streamed to a phone; native focus/disabled behavior stays intact.
 struct TouchSettingsButtonStyle: ButtonStyle {
     var selected = false
+    var horizontalPadding: CGFloat = 18
     @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(AppFonts.font(28))
             .minimumScaleFactor(0.65)
             .lineLimit(1)
-            .padding(.horizontal, 18)
+            .padding(.horizontal, horizontalPadding)
             .frame(minHeight: 72)
             .foregroundStyle(selected ? Color.white : Color.primary)
             .background(selected ? Color.accentColor : Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
