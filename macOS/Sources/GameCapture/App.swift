@@ -89,18 +89,20 @@ struct CaptureView: View {
                 }
                 VStack(spacing: 0) {
                     HStack(spacing: 8) {
-                        Button { controller.press(["HOME"]) } label: { Text("HOME").frame(width: 85) }
+                        Button { controller.press(["HOME"]) } label: { Text("HOME").frame(width: 78) }
                             .disabled(!controller.connected)
-                        Button { controller.press(["CAPTURE"]) } label: { Text("캡처").frame(width: 85) }
-                            .disabled(!controller.connected)
-                        Button { controller.press(["L", "R"]) } label: { Text("L + R").frame(width: 85) }
+                        Button { model.saveScreenshot() } label: { Text("캡처").frame(width: 78) }
+                            .disabled(!model.hasFrames || model.savingScreenshot)
+                        Button { model.muted.toggle() } label: { Text(model.muted ? "소리 켜기" : "음소거").frame(width: 78) }
+                        Button { controller.press(["L", "R"]) } label: { Text("L + R").frame(width: 78) }
                             .disabled(!controller.connected)
                         Button { cursorTask?.cancel(); NSCursor.setHiddenUntilMouseMoves(false); model.controlsVisible = false } label: {
                             Image(systemName: "xmark").font(.system(size: 30, weight: .medium))
-                                .frame(width: 72, height: 72).contentShape(Rectangle())
+                                .frame(width: 60, height: 72).contentShape(Rectangle())
                         }.buttonStyle(.plain).padding(.leading, 12).accessibilityLabel("설정 닫기").help("설정 닫기")
                     }
-                    .padding(20).frame(maxWidth: .infinity, alignment: .center)
+                    .buttonStyle(TouchSettingsButtonStyle(horizontalPadding: 8))
+                    .padding(.horizontal, 12).padding(.vertical, 20).frame(maxWidth: .infinity, alignment: .center)
                     HStack(spacing: 0) {
                         ForEach(Array(["기본", "레트로 효과", "컨트롤러"].enumerated()), id: \.offset) { index, title in
                             Button { settingsTab = index } label: { Text(title).frame(maxWidth: .infinity) }
@@ -190,6 +192,12 @@ struct CaptureView: View {
                 .allowsHitTesting(model.controlsVisible).accessibilityHidden(!model.controlsVisible)
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.5), value: model.controlsVisible)
             }.clipped()
+                .overlay(alignment: .top) {
+                    if let message = model.screenshotMessage {
+                        Text(message).padding(12).background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
+                            .foregroundStyle(.white).padding(.top, 12).allowsHitTesting(false)
+                    }
+                }
                 .onContinuousHover { phase in
                     if case .active = phase {
                         pointerInside = true

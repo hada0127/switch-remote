@@ -19,6 +19,8 @@ import AVFoundation
     @Published var running = false
     @Published var hasFrames = false
     @Published var status = "캡처카드를 선택하세요"
+    @Published var screenshotMessage: String?
+    @Published var savingScreenshot = false
     @Published var measured = ""
     @Published var volume: Double = 0.7 { didSet { defaults.set(volume, forKey: "capture.volume"); engine.volume(muted ? 0 : Float(volume)) } }
     @Published var muted = false { didSet { defaults.set(muted, forKey: "capture.muted"); engine.volume(muted ? 0 : Float(volume)) } }
@@ -27,6 +29,7 @@ import AVFoundation
     private var generation = 0
     private var lastFrame = Date.distantPast
     private var timer: Timer?
+    private var screenshotDismissTask: Task<Void, Never>?
     private let defaults: UserDefaults
     private var preferredVideo = ""
     private var preferredAudio = ""
@@ -164,6 +167,44 @@ import AVFoundation
         case .notDetermined: return await AVCaptureDevice.requestAccess(for: type)
         default: return false
         }
+    }
+    func saveScreenshot() {
+        guard hasFrames, !savingScreenshot, let frame = frameTap.latest()?.buffer else { return }
+        savingScreenshot = true
+        Task {
+            let message: String
+            do {
+                let url = try await Task.detached(priority: .userInitiated) { try Self.writeScreenshot(frame) }.value
+                message = "저장됨: \(url.lastPathComponent)"
+            } catch {
+                message = "저장 실패: \(error.localizedDescription)"
+            }
+            savingScreenshot = false
+            screenshotDismissTask?.cancel()
+            screenshotMessage = message
+            screenshotDismissTask = Task {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                guard !Task.isCancelled else { return }
+                self.screenshotMessage = nil
+            }
+        }
+    }
+    nonisolated private static func writeScreenshot(_ frame: CVPixelBuffer) throws -> URL {
+        let data = try FrameTap.png(frame, maxWidth: CVPixelBufferGetWidth(frame)).data
+        guard let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let base = "switch-remote-\(formatter.string(from: Date()))"
+        var suffix = 1
+        var url: URL
+        repeat {
+            url = folder.appendingPathComponent(base + (suffix == 1 ? "" : "-\(suffix)") + ".png")
+            suffix += 1
+        } while FileManager.default.fileExists(atPath: url.path)
+        try data.write(to: url, options: .atomic)
+        return url
     }
     func stop(message: String = "캡처가 중지됐습니다", restart: Bool = false) {
         generation += 1
