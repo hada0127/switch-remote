@@ -1,33 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Receive native mouse-up events, including remote clicks with movement between
-/// down/up that SwiftUI's tap recognizer may reject. Settings remain above this view.
-struct CapturePointerSurface: NSViewRepresentable {
-    let onClick: () -> Void
-    func makeNSView(context: Context) -> CapturePointerView {
-        let view = CapturePointerView()
-        view.onClick = onClick
-        return view
-    }
-    func updateNSView(_ view: CapturePointerView, context: Context) { view.onClick = onClick }
-}
-
-final class CapturePointerView: NSView {
-    var onClick: (() -> Void)?
-    private var pressed = false
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { pressed = true }
-    override func mouseDragged(with event: NSEvent) {}
-    override func mouseUp(with event: NSEvent) {
-        let wasPressed = pressed
-        pressed = false
-        guard wasPressed, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        onClick?()
-    }
-    override func viewDidMoveToWindow() { pressed = false }
-}
-
 /// Large targets for a desktop streamed to a phone; native focus/disabled behavior stays intact.
 struct TouchSettingsButtonStyle: ButtonStyle {
     var selected = false

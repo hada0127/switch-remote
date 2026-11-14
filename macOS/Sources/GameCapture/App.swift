@@ -15,6 +15,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var body: some Scene {
         Window("switch-remote", id: "capture") {
             CaptureView(model: capture, controller: controller, settingsTab: $settingsTab).frame(minWidth: 560, minHeight: 460)
+                .toolbar {
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        Button { capture.saveScreenshot() } label: { Image(systemName: "camera") }
+                            .disabled(!capture.hasFrames || capture.savingScreenshot)
+                            .accessibilityLabel("캡처").help("캡처")
+                        Button { capture.muted.toggle() } label: {
+                            Image(systemName: capture.muted ? "speaker.slash" : "speaker.wave.2")
+                        }
+                        .accessibilityLabel(capture.muted ? "소리 켜기" : "음소거")
+                        .help(capture.muted ? "소리 켜기" : "음소거")
+                        Button { capture.controlsVisible = true } label: { Image(systemName: "gearshape") }
+                            .accessibilityLabel("설정 보기").help("설정 보기")
+                    }
+                }
                 .onAppear { AgentControl.start(capture: capture, controller: controller) }
         }
         .defaultSize(width: 1200, height: 800)
@@ -74,11 +88,6 @@ struct CaptureView: View {
                 if let renderer = model.renderer {
                     ShaderPreview(renderer: renderer, settings: effects.settings, enabled: model.running && useShader)
                         .opacity(model.hasFrames && useShader ? 1 : 0).allowsHitTesting(false)
-                }
-                CapturePointerSurface {
-                    cursorTask?.cancel()
-                    NSCursor.setHiddenUntilMouseMoves(false)
-                    model.controlsVisible.toggle()
                 }
                 if !model.hasFrames {
                     VStack(spacing: 12) {
