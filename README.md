@@ -22,7 +22,7 @@ You can watch and hear the Switch without a Pi. The Pi is only needed to send co
 2. Move `switch-remote.app` to Applications and open it.
 3. Connect the Switch dock's HDMI output to the capture card, then connect the card to your Mac.
 4. Allow camera and microphone access when macOS asks. These permissions let the app receive the card's picture and sound.
-5. Click the picture to open settings.
+5. Click the **Settings** button (gear icon) in the window toolbar to open settings. The toolbar also has Capture and Mute buttons.
 
 The app has three tabs. The tab names are currently shown in Korean.
 
@@ -32,7 +32,7 @@ Choose your video device, audio device, and resolution/frame rate. If you see a 
 
 The available resolutions depend on your capture card. A card that passes 4K60 through to a TV may capture at a lower resolution or frame rate. For example, Elgato HD60 X captures up to 4K30.
 
-Press **Control–Command–F** for full screen. Click **×** to close settings; click the picture to open them again. The pointer hides after three seconds without movement and returns when you move it.
+Press **Control–Command–F** for full screen. Click **×** to close settings; press **Command-comma** to open them again in full screen. In a window, use the toolbar's Settings button. The pointer hides after three seconds without movement and returns when you move it.
 
 ## Retro effects (레트로 효과)
 

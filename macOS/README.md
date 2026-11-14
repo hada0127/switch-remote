@@ -12,7 +12,7 @@ The build defaults to the owner's existing `Developer ID Application: eunkyu lee
 
 ## Controls
 
-The original app's black video canvas and floating white panel are retained. Click the video or press Command-comma to hide/show settings. Select Video, Audio and Resolution directly; a running capture restarts with the new selection. The panel's Capture button saves the latest raw capture-card frame at full resolution as a PNG in Downloads; its sound button toggles mute. Start/stop: Command-Return. Mute: Shift-Command-M. Full screen: Control-Command-F or the window's green button. Closing the window quits the app and releases capture/audio. Volume and start/stop also remain in the Capture menu. The viewer starts automatically when an input is available at launch.
+The original app's black video canvas and floating white panel are retained. The window toolbar has Capture, Mute and Settings buttons; Settings opens the panel. Press Command-comma to show or hide settings, including in full screen after closing the panel. Select Video, Audio and Resolution directly; a running capture restarts with the new selection. The toolbar and panel Capture buttons save the latest raw capture-card frame at full resolution as a PNG in Downloads; their sound buttons toggle mute. Start/stop: Command-Return. Mute: Shift-Command-M. Full screen: Control-Command-F or the window's green button. Closing the window quits the app and releases capture/audio. Volume and start/stop also remain in the Capture menu. The viewer starts automatically when an input is available at launch.
 
 Hada Sans Regular/SemiBold are bundled and loaded directly from their font files; no font installation is needed. Their OFL license and copyright notices are included.
 
