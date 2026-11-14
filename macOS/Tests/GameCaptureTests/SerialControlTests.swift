@@ -96,7 +96,7 @@ final class SerialControlTests: XCTestCase {
         XCTAssertTrue(ControllerModel.chooseSerial(endpointFound: false, serialAvailable: true, preferSerial: false, pair: false))
     }
 
-    @MainActor func testCableAloneAllowsConnectButNotPairing() throws {
+    @MainActor func testCableAloneAllowsConnectButNotPairing() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let saved = UserDefaults.standard.object(forKey: "pi.automatic")
@@ -109,6 +109,7 @@ final class SerialControlTests: XCTestCase {
         try store.enroll(JSONSerialization.data(withJSONObject: enrollment))
         let cable = ControllerModel(startDiscovery: false, controllerProvider: { [] }, store: store,
                                     serialProbe: { "/dev/cu.usbserial-TEST" })
+        let appeared = await waitMain(1) { cable.serialCable }; XCTAssertTrue(appeared)
         XCTAssertEqual(cable.selectedPi, goldenID)
         XCTAssertTrue(cable.serialCable)
         XCTAssertTrue(cable.canConnect)
@@ -116,6 +117,7 @@ final class SerialControlTests: XCTestCase {
         XCTAssertFalse(cable.running)
         XCTAssertTrue((cable.agentStatus()["controller"] as? [String: Any])?["control"] is NSNull)
         let none = ControllerModel(startDiscovery: false, controllerProvider: { [] }, store: store, serialProbe: { nil })
+        let unexpectedlyAppeared = await waitMain(0.1) { none.serialCable }; XCTAssertFalse(unexpectedlyAppeared)
         XCTAssertFalse(none.serialCable)
         XCTAssertFalse(none.canConnect)
         XCTAssertFalse(none.canPair)
@@ -145,6 +147,7 @@ final class SerialControlTests: XCTestCase {
 
         // Cable present, Bonjour silent: nothing at start, the cable after the grace.
         let late = cableModel(store, path: pi.path, grace: 0.3)
+        let lateCable = await waitMain(1) { late.serialCable }; XCTAssertTrue(lateCable)
         XCTAssertTrue(late.automatic); XCTAssertTrue(late.canConnect)
         XCTAssertFalse(late.running, "picked the cable before Bonjour had a chance")
         try await Task.sleep(for: .milliseconds(100))
@@ -157,6 +160,7 @@ final class SerialControlTests: XCTestCase {
 
         // Bonjour answers during the grace: TLS right away, and the grace end does not switch to the cable.
         let early = cableModel(store, path: pi.path, grace: 0.3)
+        let earlyCable = await waitMain(1) { early.serialCable }; XCTAssertTrue(earlyCable)
         XCTAssertFalse(early.running)
         early.discoveryChanged([DiscoveredPi(id: goldenID, name: "pi", host: "127.0.0.1", port: 9)])
         XCTAssertTrue(early.running); XCTAssertFalse(early.serialSession)
@@ -167,6 +171,7 @@ final class SerialControlTests: XCTestCase {
 
         // A manual disconnect during the grace cancels the pending cable connect.
         let cancelled = cableModel(store, path: pi.path, grace: 0.3)
+        let cancelledCable = await waitMain(1) { cancelled.serialCable }; XCTAssertTrue(cancelledCable)
         XCTAssertFalse(cancelled.running)
         cancelled.disconnect()
         try await Task.sleep(for: .milliseconds(600))
@@ -177,8 +182,6 @@ final class SerialControlTests: XCTestCase {
 
     private func makePty() throws -> PtyPi {
         guard let pty = PtyPi() else { throw XCTSkip("BLOCKED: openpty failed (errno \(errno))") }
-        do { _ = try SerialControllerTransport(path: pty.path, queue: DispatchQueue(label: "probe")) {} }
-        catch { throw XCTSkip("BLOCKED: pty termios setup failed: \(error)") }
         return pty
     }
     private func device() -> PairedPi {
@@ -190,10 +193,230 @@ final class SerialControlTests: XCTestCase {
         return condition()
     }
 
+    func testSerialLaneRejectsOpenDuringBlockedOpenAndDelayedClose() throws {
+        let pi = try makePty()
+        let opening = DispatchSemaphore(value: 0)
+        let releaseOpen = DispatchSemaphore(value: 0)
+        let closing = DispatchSemaphore(value: 0)
+        let releaseClose = DispatchSemaphore(value: 0)
+        let replies = DispatchQueue(label: "serial-lane-test-replies")
+        var attempts = 0
+        let lane = SerialLane { path, queue, failure in
+            attempts += 1
+            if attempts == 1 {
+                opening.signal()
+                _ = releaseOpen.wait(timeout: .now() + 2)
+            }
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let opened = expectation(description: "first open")
+        let first = lane.open(path: pi.path, lookup: false, on: replies, result: { outcome in
+            if case .failure(let error) = outcome { XCTFail("open: \(error)") }
+            opened.fulfill()
+        }, failure: {}, control: { _, _ in }, metrics: { _, _ in })
+        XCTAssertTrue(first)
+        XCTAssertEqual(opening.wait(timeout: .now() + 1), .success)
+        XCTAssertFalse(lane.open(path: pi.path, lookup: false, on: replies, result: { _ in XCTFail("overlapping open") },
+                                 failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        releaseOpen.signal()
+        wait(for: [opened], timeout: 2)
+
+        let closed = expectation(description: "close completed")
+        lane.close(after: { _ in closing.signal(); _ = releaseClose.wait(timeout: .now() + 2) },
+                   completion: { closed.fulfill() })
+        XCTAssertEqual(closing.wait(timeout: .now() + 1), .success)
+        XCTAssertFalse(lane.open(path: pi.path, lookup: false, on: replies, result: { _ in XCTFail("open before close") },
+                                 failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        releaseClose.signal()
+        wait(for: [closed], timeout: 2)
+        let reopened = expectation(description: "reopen after close")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies, result: { outcome in
+            if case .failure(let error) = outcome { XCTFail("reopen: \(error)") }
+            reopened.fulfill()
+        }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        wait(for: [reopened], timeout: 2)
+        let finalClose = expectation(description: "final close")
+        lane.close(completion: { finalClose.fulfill() })
+        wait(for: [finalClose], timeout: 2)
+    }
+
+    func testBlockedOpenKeepsMetricsAndStopNowBoundedAndDiscardsStaleResult() throws {
+        let pi = try makePty()
+        let opening = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        var attempts = 0
+        let lane = SerialLane { path, queue, failure in
+            attempts += 1
+            if attempts == 1 {
+                opening.signal()
+                _ = release.wait(timeout: .now() + 2)
+            }
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let bridge = PiControlBridge(serialLane: lane)
+        bridge.startSerial(device: device(), path: pi.path)
+        XCTAssertEqual(opening.wait(timeout: .now() + 1), .success)
+        let started = ProcessInfo.processInfo.systemUptime
+        _ = bridge.transportMetrics()
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - started, 0.1)
+        let stopping = ProcessInfo.processInfo.systemUptime
+        bridge.stopNow()
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - stopping, 0.5)
+        release.signal()
+        let reopened = expectation(description: "stale open closed")
+        XCTAssertTrue(wait(2) { lane.open(path: pi.path, lookup: false, on: .main,
+                                          result: { _ in reopened.fulfill() }, failure: {},
+                                          control: { _, _ in }, metrics: { _, _ in }) })
+        wait(for: [reopened], timeout: 2)
+        let closed = expectation(description: "probe owner closed")
+        lane.close(completion: { closed.fulfill() })
+        wait(for: [closed], timeout: 2)
+        XCTAssertTrue(wait(1) { bridge.transportMetrics() == nil })
+        XCTAssertNil(pi.nextControl(SerialControl.hello, timeout: 0.1), "stale open sent HELLO")
+    }
+
+    func testDuplicateSerialFailureReportsOneLinkError() throws {
+        let pi = try makePty()
+        let callbackLock = NSLock()
+        var deviceFailure: (() -> Void)?
+        let lane = SerialLane { path, queue, failure in
+            callbackLock.lock(); deviceFailure = failure; callbackLock.unlock()
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let recorder = BridgeRecorder()
+        let bridge = PiControlBridge(serialLane: lane)
+        bridge.onMessage = { state, detail in recorder.message(state, detail) }
+        bridge.startSerial(device: device(), path: pi.path)
+        XCTAssertNotNil(pi.nextControl(SerialControl.hello, timeout: 1))
+        callbackLock.lock(); let fail = deviceFailure; callbackLock.unlock()
+        fail?(); fail?()
+        XCTAssertTrue(wait(1) { recorder.contains("link-error", nil) })
+        XCTAssertEqual(recorder.messages.filter { $0.0 == "link-error" }.count, 1)
+    }
+
+    func testFailedSetupReleasesLaneForNextOpen() throws {
+        let pi = try makePty()
+        let replies = DispatchQueue(label: "serial-setup-test-replies")
+        var attempts = 0
+        let lane = SerialLane { path, queue, failure in
+            attempts += 1
+            if attempts == 1 { throw POSIXError(.EIO) }
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let failed = expectation(description: "setup failure")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies, result: { outcome in
+            if case .success = outcome { XCTFail("setup unexpectedly succeeded") }
+            failed.fulfill()
+        }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        wait(for: [failed], timeout: 1)
+        let opened = expectation(description: "next open")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies, result: { outcome in
+            if case .failure(let error) = outcome { XCTFail("next open: \(error)") }
+            opened.fulfill()
+        }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        wait(for: [opened], timeout: 1)
+        let closed = expectation(description: "close")
+        lane.close(completion: { closed.fulfill() })
+        wait(for: [closed], timeout: 1)
+    }
+
+    func testFailedOpenWithPendingCloseKeepsReservationUntilCloseCompletes() throws {
+        let pi = try makePty()
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        let closeEntered = DispatchSemaphore(value: 0), releaseClose = DispatchSemaphore(value: 0)
+        let replies = DispatchQueue(label: "failed-open-replies")
+        var attempts = 0
+        let lane = SerialLane { path, queue, failure in
+            attempts += 1
+            if attempts == 1 {
+                queue.async { closeEntered.signal(); _ = releaseClose.wait(timeout: .now() + 3) }
+                entered.signal(); _ = resume.wait(timeout: .now() + 3)
+                throw POSIXError(.EIO)
+            }
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let failed = expectation(description: "open failed")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies,
+                                result: { _ in failed.fulfill() }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let closed = expectation(description: "pending close completed")
+        lane.close(completion: { closed.fulfill() })
+        resume.signal()
+        wait(for: [failed], timeout: 2)
+        XCTAssertEqual(closeEntered.wait(timeout: .now() + 1), .success)
+        XCTAssertFalse(lane.open(path: pi.path, lookup: false, on: replies,
+                                 result: { _ in XCTFail("accepted before close") }, failure: {},
+                                 control: { _, _ in }, metrics: { _, _ in }))
+        releaseClose.signal()
+        wait(for: [closed], timeout: 2)
+        let second = expectation(description: "new owner receives result")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies,
+                                result: { outcome in
+                                    if case .failure(let error) = outcome { XCTFail("new owner: \(error)") }
+                                    second.fulfill()
+                                }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        wait(for: [second], timeout: 2)
+        let finalClose = expectation(description: "new owner closed")
+        lane.close(completion: { finalClose.fulfill() })
+        wait(for: [finalClose], timeout: 2)
+    }
+
+    func testCloseInvalidatesAcceptedWorkBeforeItRuns() throws {
+        let pi = try makePty()
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        let replies = DispatchQueue(label: "cancel-work-replies")
+        let lane = SerialLane { path, queue, failure in
+            let serial = try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+            queue.async { entered.signal(); _ = resume.wait(timeout: .now() + 3) }
+            return serial
+        }
+        let opened = expectation(description: "opened")
+        XCTAssertTrue(lane.open(path: pi.path, lookup: false, on: replies,
+                                result: { _ in opened.fulfill() }, failure: {}, control: { _, _ in }, metrics: { _, _ in }))
+        wait(for: [opened], timeout: 2)
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let skipped = expectation(description: "accepted work cancelled")
+        XCTAssertTrue(lane.perform({ try $0.sendControl(type: SerialControl.usb, body: []) },
+                                   completion: { XCTAssertNotNil($0); skipped.fulfill() }))
+        let closed = expectation(description: "close completed")
+        lane.close(completion: { closed.fulfill() })
+        resume.signal()
+        wait(for: [skipped, closed], timeout: 2)
+        XCTAssertNil(pi.nextControl(SerialControl.usb, timeout: 0.1))
+    }
+
+    func testBlockedCableOpenReportsLinkErrorAndKeepsReservation() throws {
+        let pi = try makePty()
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        var attempts = 0
+        let lane = SerialLane { path, queue, failure in
+            attempts += 1
+            if attempts == 1 {
+                entered.signal(); _ = resume.wait(timeout: .now() + 5)
+            }
+            return try SerialControllerTransport(path: path, queue: queue, onFailure: failure)
+        }
+        let recorder = BridgeRecorder(), bridge = PiControlBridge(serialLane: lane)
+        bridge.onMessage = { state, detail in recorder.message(state, detail) }
+        bridge.startSerial(device: device(), path: pi.path)
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        XCTAssertTrue(wait(2.5) { recorder.contains("link-error", nil) })
+        XCTAssertFalse(lane.open(path: pi.path, lookup: false, on: .main,
+                                 result: { _ in XCTFail("overlapping open") }, failure: {},
+                                 control: { _, _ in }, metrics: { _, _ in }))
+        resume.signal()
+        XCTAssertTrue(wait(2) { lane.open(path: pi.path, lookup: false, on: .main,
+                                          result: { _ in }, failure: {}, control: { _, _ in }, metrics: { _, _ in }) })
+        let closed = expectation(description: "new owner closed")
+        lane.close(completion: { closed.fulfill() })
+        wait(for: [closed], timeout: 2)
+        XCTAssertNil(pi.nextControl(SerialControl.hello, timeout: 0.1))
+    }
+
     func testPtySerialSessionHandshakeStatusUSBAndBye() throws {
         let pi = try makePty()
         let recorder = BridgeRecorder()
-        let bridge = PiControlBridge()
+        let bridge = PiControlBridge(serialLane: SerialLane())
         bridge.onMessage = { state, message in recorder.message(state, message) }
         bridge.onUSBState = { recorder.usb($0) }
         bridge.startSerial(device: device(), path: pi.path)
@@ -225,17 +448,51 @@ final class SerialControlTests: XCTestCase {
         pi.write(SerialFrame.make(control: SerialControl.usbResult, body: [0, 0, 0, 1, 0]))
         XCTAssertNil(pi.nextControl(SerialControl.usb, timeout: 0.7), "USB command resent after USB_RESULT")
 
-        bridge.stop()
+        bridge.stopNow()
         let bye = try XCTUnwrap(pi.nextControl(SerialControl.bye, timeout: 1), "no BYE on stop")
         XCTAssertEqual(SerialControl.readBigEndian(bye, at: 0), nonce)
         XCTAssertFalse(recorder.contains("link-error", nil) || recorder.contains("error", nil))
+    }
+
+    func testBusyLaneDoesNotConsumeUSBAttemptsAndDetachSendsNeutralFirst() throws {
+        let pi = try makePty()
+        let lane = SerialLane()
+        let recorder = BridgeRecorder()
+        let bridge = PiControlBridge(serialLane: lane)
+        bridge.onMessage = { state, detail in recorder.message(state, detail) }
+        bridge.startSerial(device: device(), path: pi.path)
+        let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1))
+        let nonce = SerialControl.readBigEndian(hello, at: 1)
+        pi.write(SerialFrame.make(control: SerialControl.helloReply,
+                                  body: [1, 0] + SerialControl.bigEndian(nonce) + goldenIDBytes))
+        pi.write(SerialFrame.make(control: SerialControl.status, body: [3, 1]))
+        XCTAssertTrue(wait(1) { recorder.contains("connected", nil) })
+        let entered = DispatchSemaphore(value: 0), resume = DispatchSemaphore(value: 0)
+        XCTAssertTrue(wait(1) { lane.perform({ _ in
+            entered.signal(); _ = resume.wait(timeout: .now() + 3)
+        }, completion: { _ in }) })
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        bridge.controlUSB("detach")
+        XCTAssertNil(pi.nextControl(SerialControl.usb, timeout: 0.5))
+        resume.signal()
+        let neutral = try XCTUnwrap(pi.nextFrame(timeout: 1) { $0[2] == 24 || ($0[2] == 26 && $0[3] == SerialControl.usb) })
+        XCTAssertEqual(neutral[2], 24)
+        XCTAssertEqual(Array(neutral[11..<27]), Array(SerialFrame.make(sequence: 1, input: .neutral)[11..<27]))
+        let first = try XCTUnwrap(pi.nextControl(SerialControl.usb, timeout: 1))
+        XCTAssertEqual(SerialControl.readBigEndian(first, at: 0), 1)
+        for _ in 0..<3 {
+            let retry = try XCTUnwrap(pi.nextControl(SerialControl.usb, timeout: 1))
+            XCTAssertEqual(Array(retry[0..<5]), Array(first[0..<5]))
+        }
+        XCTAssertNil(pi.nextControl(SerialControl.usb, timeout: 0.4), "more than four accepted attempts")
+        bridge.stopNow()
     }
 
     // App termination: BYE must already be on the wire when stopNow returns.
     func testPtySerialStopNowWritesByeBeforeReturn() throws {
         let pi = try makePty()
         let recorder = BridgeRecorder()
-        let bridge = PiControlBridge()
+        let bridge = PiControlBridge(serialLane: SerialLane())
         bridge.onMessage = { state, message in recorder.message(state, message) }
         bridge.startSerial(device: device(), path: pi.path)
         let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1), "no HELLO")
@@ -255,7 +512,7 @@ final class SerialControlTests: XCTestCase {
         for (reason, expected) in [(UInt8(2), "link-error"), (UInt8(1), "error")] {
             let pi = try makePty()
             let recorder = BridgeRecorder()
-            let bridge = PiControlBridge()
+            let bridge = PiControlBridge(serialLane: SerialLane())
             bridge.onMessage = { state, message in recorder.message(state, message) }
             bridge.startSerial(device: device(), path: pi.path)
             let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1), "no HELLO")
@@ -269,14 +526,14 @@ final class SerialControlTests: XCTestCase {
             XCTAssertTrue(wait(1) { recorder.contains(expected, nil) }, "reason \(reason): \(recorder.messages)")
             XCTAssertFalse(recorder.contains(expected == "error" ? "link-error" : "error", nil), "reason \(reason): \(recorder.messages)")
             XCTAssertNil(pi.nextControl(SerialControl.bye, timeout: 0.3), "Mac answered a Pi BYE")
-            bridge.stop()
+            bridge.stopNow()
         }
     }
 
     func testPtySerialHelloTimeoutIsLinkError() throws {
         let pi = try makePty()
         let recorder = BridgeRecorder()
-        let bridge = PiControlBridge()
+        let bridge = PiControlBridge(serialLane: SerialLane())
         bridge.onMessage = { state, message in recorder.message(state, message) }
         let started = Date()
         bridge.startSerial(device: device(), path: pi.path)
@@ -294,7 +551,7 @@ final class SerialControlTests: XCTestCase {
                                        (UInt8(0), [UInt8](repeating: 0x99, count: 16), "케이블에 연결된 파이가 선택한 파이와 다릅니다.")] {
             let pi = try makePty()
             let recorder = BridgeRecorder()
-            let bridge = PiControlBridge()
+            let bridge = PiControlBridge(serialLane: SerialLane())
             bridge.onMessage = { state, message in recorder.message(state, message) }
             bridge.startSerial(device: device(), path: pi.path)
             let hello = try XCTUnwrap(pi.nextControl(SerialControl.hello, timeout: 1))

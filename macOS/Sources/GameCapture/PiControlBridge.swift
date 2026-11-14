@@ -16,21 +16,25 @@ extension SSHControllerBridge: ControllerSession {}
 /// Without TLS (`startSerial`), the cable carries both control frames and input.
 final class PiControlBridge: ControllerSession, @unchecked Sendable {
     private let queue = DispatchQueue(label: "net.tarucy.controller.network", qos: .userInteractive)
+    private let serialLane: SerialLane
+    init(serialLane: SerialLane = .shared) { self.serialLane = serialLane }
     private let lock = NSLock()
     private var pending = ControllerTransitionBuffer()
     private var scheduled = false
     private var connection: NWConnection?
     private var udp: UDPControllerTransport?
-    private var serial: SerialControllerTransport?
+    private var serialOwned = false
+    private var serialOpening = false
+    private var serialOpenedAt = 0.0
+    private var serialAck = 0.0
+    private var serialMetrics: TransportMetrics?
+    private var generation: UInt64 = 0
+    private var cachedMetrics: TransportMetrics?
     private var serialTimer: DispatchSourceTimer?
     private var lastSerialAttempt = 0.0
     private var serialRetrySeconds = 1.0
     private var latest = ControllerInput.neutral
     private var outboundSequence: UInt64 = 0
-    private var serialLast: ControllerInput?
-    private var serialLastSent = -Double.infinity
-    private var serialDeferred: ControllerInput?
-    private var serialAxisWork: DispatchWorkItem?
     private var buffer = Data()
     private var timer: DispatchSourceTimer?
     private var active = false
@@ -53,11 +57,9 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     func controlUSB(_ action: String) {
         queue.async { [self] in
             guard Self.canControlUSB(active: active, hasAuthenticatedTransport: udp != nil || serialReady), action == "detach" || action == "attach" else { return }
-            if action == "detach" {
+            if action == "detach" && !serialLink {
                 lock.lock(); pending.append(.neutral, at: ProcessInfo.processInfo.systemUptime); lock.unlock()
                 flush()
-                // The neutral state must reach the Pi before the USB command on the same cable.
-                if serialLink, let work = serialAxisWork { work.perform(); work.cancel() }
             }
             guard serialLink else { write(["type": "usb", "action": action]); return }
             usbCommandID = usbCommandID == UInt32.max ? 1 : usbCommandID + 1
@@ -84,7 +86,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     func start(device: PairedPi, endpoint: DiscoveredPi, pair: Bool) {
         queue.async { [self] in
             guard connection == nil, !serialLink, let port = NWEndpoint.Port(rawValue: UInt16(exactly: endpoint.port) ?? 0), endpoint.port > 0 else { return }
-            self.device = device; host = endpoint.host; active = true
+            self.device = device; host = endpoint.host; active = true; publishMetrics()
             lastReply = ProcessInfo.processInfo.systemUptime
             let tls = NWProtocolTLS.Options()
             sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
@@ -129,43 +131,96 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
     /// Control over the GPIO UART alone, for when Wi-Fi or Bonjour is down.
     func startSerial(device: PairedPi, path: String) {
         queue.async { [self] in
-            guard !active, connection == nil, serial == nil else { return }
+            guard !active, connection == nil, !serialOwned else { return }
             self.device = device; serialLink = true; serialReady = false; active = true; startup = true
             let now = ProcessInfo.processInfo.systemUptime
             lastReply = now; helloStarted = now
-            do {
-                serial = try SerialControllerTransport(path: path, queue: queue) { [weak self] in
-                    self?.linkFail("케이블 연결이 끊겼습니다.")
-                }
-            } catch { linkFail("케이블을 열 수 없습니다: \(error.localizedDescription)"); return }
-            serial?.onControl = { [weak self] type, body in self?.receiveControl(type, body) }
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
-            timer.setEventHandler { [weak self] in
-                guard let self, self.active, self.serialReady else { return }
-                if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) { self.linkFail("파이 응답이 없어 다시 연결합니다.") }
+            publishMetrics()
+            guard openSerial(path: path, lookup: false) else {
+                linkFail("케이블이 사용 중입니다."); return
             }
-            self.timer = timer; timer.resume()
-            let tick = DispatchSource.makeTimerSource(queue: queue)
-            tick.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20))
-            tick.setEventHandler { [weak self] in self?.serialTick() }
-            serialTimer = tick; tick.resume()
-            sendHello()
+            let token = generation
+            queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, self.active, self.serialLink, self.serialOpening,
+                      self.generation == token else { return }
+                self.linkFail("케이블을 열 수 없습니다: 시간 초과")
+            }
         }
     }
+    @discardableResult private func openSerial(path: String?, lookup: Bool) -> Bool {
+        let token = generation
+        let accepted = serialLane.open(path: path, lookup: lookup, on: queue,
+            result: { [weak self] outcome in
+                guard let self, self.generation == token, self.active else { return }
+                self.serialOpening = false
+                switch outcome {
+                case .success(let (openedAt, snapshot)):
+                    self.serialOpenedAt = openedAt; self.serialMetrics = snapshot
+                    self.publishMetrics()
+                    if self.serialLink {
+                        self.helloStarted = ProcessInfo.processInfo.systemUptime
+                        let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                        timer.schedule(deadline: .now() + 1, repeating: .seconds(1))
+                        timer.setEventHandler { [weak self] in
+                            guard let self, self.active, self.serialReady else { return }
+                            if ProcessInfo.processInfo.systemUptime - self.lastReply > (self.startup ? 70 : 8) {
+                                self.linkFail("파이 응답이 없어 다시 연결합니다.")
+                            }
+                        }
+                        self.timer = timer; timer.resume()
+                        let tick = DispatchSource.makeTimerSource(queue: self.queue)
+                        tick.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20))
+                        tick.setEventHandler { [weak self] in self?.serialTick() }
+                        self.serialTimer = tick; tick.resume()
+                        self.sendHello()
+                    } else {
+                        self.sendSerial(self.latest, sequence: self.nextSequence())
+                    }
+                case .failure(let error):
+                    self.serialOwned = false
+                    if self.serialLink { self.linkFail("케이블을 열 수 없습니다: \(error.localizedDescription)") }
+                    else { self.serialRetrySeconds = min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2) }
+                }
+            }, failure: { [weak self] in
+                guard let self, self.generation == token, self.active else { return }
+                self.serialFailure("케이블 연결이 끊겼습니다.")
+            }, control: { [weak self] type, body in
+                guard let self, self.generation == token, self.active else { return }
+                self.receiveControl(type, body)
+            }, metrics: { [weak self] snapshot, ack in
+                guard let self, self.generation == token, self.active else { return }
+                self.serialMetrics = snapshot; self.serialAck = ack; self.publishMetrics()
+            })
+        if accepted { serialOwned = true; serialOpening = true }
+        return accepted
+    }
     private func sendHello() {
-        guard active, let serial else { return }
+        guard active, serialOwned else { return }
         lastHelloSent = ProcessInfo.processInfo.systemUptime
-        do { try serial.sendControl(type: SerialControl.hello, body: SerialControl.helloBody(nonce: helloNonce)) }
-        catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)") }
+        sendControl(type: SerialControl.hello, body: SerialControl.helloBody(nonce: helloNonce))
     }
     /// Resent every 250 ms, at most 4 times, until USB_RESULT, BYE or finish.
     private func sendUSBCommand() {
-        guard active, serialReady, let serial, var command = usbPending else { return }
+        guard active, serialReady, serialOwned, var command = usbPending else { return }
+        let neutralSequence = command.action == "detach" ? nextSequence() : nil
+        guard sendControl(type: SerialControl.usb,
+                          body: SerialControl.usbBody(id: command.id, action: command.action),
+                          neutralSequence: neutralSequence) else { return }
         command.sent += 1; command.lastSent = ProcessInfo.processInfo.systemUptime
         usbPending = command.sent >= 4 ? nil : command
-        do { try serial.sendControl(type: SerialControl.usb, body: SerialControl.usbBody(id: command.id, action: command.action)) }
-        catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)") }
+    }
+    @discardableResult private func sendControl(type: UInt8, body: [UInt8], neutralSequence: UInt64? = nil) -> Bool {
+        let token = generation
+        return serialLane.perform({ serial in
+            if let neutralSequence { try serial.send(.neutral, sequence: neutralSequence) }
+            try serial.sendControl(type: type, body: body)
+        }) { [weak self] error in
+            guard let self, let error else { return }
+            self.queue.async {
+                guard self.generation == token, self.active else { return }
+                self.serialFailure("케이블 쓰기 실패: \(error.localizedDescription)")
+            }
+        }
     }
     private func serialTick() {
         guard active, serialLink else { return }
@@ -253,7 +308,7 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
                 guard udp == nil, let version = message["version"] as? Int, (1...2).contains(version),
                       let port = message["port"] as? Int, let encoded = message["key"] as? String,
                       let key = Data(base64Encoded: encoded) else { fail("UDP 연결 정보 오류"); return }
-                do { udp = try UDPControllerTransport(host: host, port: port, key: key, version: version, queue: queue); checkSerial(); flush() }
+                do { udp = try UDPControllerTransport(host: host, port: port, key: key, version: version, queue: queue); publishMetrics(); checkSerial(); flush() }
                 catch { fail(error.localizedDescription); return }
             case "status":
                 guard let state = message["state"] as? String else { continue }
@@ -281,112 +336,81 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         outboundSequence += 1
         return outboundSequence
     }
+    private func publishMetrics() {
+        let snapshot: TransportMetrics?
+        if !active { snapshot = nil }
+        else if serialLink { snapshot = serialMetrics }
+        else if serialOwned && Self.serialHealthy(openedAt: serialOpenedAt, lastAck: serialAck,
+                                                   now: ProcessInfo.processInfo.systemUptime) { snapshot = serialMetrics }
+        else if let udp { snapshot = udp.metrics }
+        else { snapshot = connection == nil ? nil : TransportMetrics(kind: "tls", rtt: nil) }
+        lock.lock(); cachedMetrics = snapshot; lock.unlock()
+    }
     private func dropSerial() {
-        serial = nil
-        serialAxisWork?.cancel(); serialAxisWork = nil
-        serialDeferred = nil; serialLast = nil
+        guard serialOwned else { return }
+        serialOwned = false; serialOpening = false; serialReady = false
+        serialMetrics = nil; serialAck = 0; generation &+= 1
+        serialLane.close()
+        publishMetrics()
+    }
+    private func serialFailure(_ message: String) {
+        guard serialOwned else { return }
+        if serialLink { linkFail(message); return }
+        serialRetrySeconds = serialAck == 0 ? min(hidConnected ? 2 : 30, serialRetrySeconds * 2) : 1
+        lastSerialAttempt = ProcessInfo.processInfo.systemUptime
+        dropSerial()
+        if let udp { try? udp.send(latest, sequence: nextSequence()) }
     }
     private func checkSerial() {
-        guard active, !serialLink, let udp else { return }
+        guard active, !serialLink, udp != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if let serial {
-            if now - serial.openedAt > 0.15 && !Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: now) {
-                serialRetrySeconds = serial.lastAck == 0 ? min(hidConnected ? 2 : 30, serialRetrySeconds * 2) : 1
-                lastSerialAttempt = now
-                dropSerial()
-                // Repair any held input immediately after losing the cable.
-                try? udp.send(latest, sequence: nextSequence())
+        if serialOwned {
+            if !serialOpening && now - serialOpenedAt > 0.15 &&
+                !Self.serialHealthy(openedAt: serialOpenedAt, lastAck: serialAck, now: now) {
+                serialFailure("케이블 응답 없음")
+            } else if Self.serialHealthy(openedAt: serialOpenedAt, lastAck: serialAck, now: now) {
+                serialRetrySeconds = 1
             }
-            if Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: now) { serialRetrySeconds = 1 }
+            publishMetrics()
             return
         }
         guard now - lastSerialAttempt >= serialRetrySeconds else { return }
         lastSerialAttempt = now
-        guard let path = SerialControllerTransport.devicePath() else { return }
-        do {
-            serial = try SerialControllerTransport(path: path, queue: queue) { [weak self] in
-                guard let self, self.active else { return }
-                self.serialRetrySeconds = self.serial?.lastAck == 0 ? min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2) : 1
-                self.lastSerialAttempt = ProcessInfo.processInfo.systemUptime
-                self.dropSerial()
-                if let udp = self.udp { try? udp.send(self.latest, sequence: self.nextSequence()) }
-            }
-            try serial?.send(latest, sequence: nextSequence())
-            serialLast = latest; serialLastSent = now
-        } catch { serialRetrySeconds = min(hidConnected ? 2 : 30, serialRetrySeconds * 2); lastSerialAttempt = now; dropSerial() }
+        _ = openSerial(path: nil, lookup: true)
+        publishMetrics()
     }
-    /// At 115200, a 29-byte state takes about 2.5 ms. Merge analog-only
-    /// bursts into a 4 ms interval; button transitions still go immediately.
-    private func sendSerial(_ value: ControllerInput, sequence: UInt64? = nil) throws -> Bool {
-        guard let serial else { return false }
-        let now = ProcessInfo.processInfo.systemUptime
-        if serialLast?.buttons == value.buttons && now - serialLastSent < 0.004 {
-            if sequence != nil {
-                serialAxisWork?.cancel(); serialAxisWork = nil; serialDeferred = nil
-                return false
+    /// A busy serial lane drops this input; UDP still receives it when available.
+    @discardableResult private func sendSerial(_ value: ControllerInput, sequence: UInt64? = nil) -> Bool {
+        guard serialOwned, !serialOpening else { return false }
+        let number = sequence ?? nextSequence()
+        let token = generation
+        if serialLane.perform({ try $0.send(value, sequence: number) }, completion: { [weak self] error in
+            guard let self, let error else { return }
+            self.queue.async {
+                guard self.generation == token, self.active else { return }
+                self.serialFailure("케이블 쓰기 실패: \(error.localizedDescription)")
             }
-            serialDeferred = value
-            if serialAxisWork == nil {
-                let work = DispatchWorkItem { [weak self] in
-                    guard let self else { return }
-                    self.serialAxisWork = nil
-                    guard let value = self.serialDeferred, let serial = self.serial else { return }
-                    self.serialDeferred = nil
-                    do {
-                        try serial.send(value, sequence: self.nextSequence())
-                        self.serialLast = value; self.serialLastSent = ProcessInfo.processInfo.systemUptime
-                    } catch {
-                        if self.serialLink { self.linkFail("케이블 쓰기 실패: \(error.localizedDescription)"); return }
-                        self.serialRetrySeconds = min(self.hidConnected ? 2 : 30, self.serialRetrySeconds * 2)
-                        self.lastSerialAttempt = ProcessInfo.processInfo.systemUptime
-                        self.dropSerial()
-                        if let udp = self.udp { try? udp.send(self.latest, sequence: self.nextSequence()) }
-                    }
-                }
-                serialAxisWork = work
-                queue.asyncAfter(deadline: .now() + (serialLastSent + 0.004 - now), execute: work)
-            }
-            return false
-        }
-        serialAxisWork?.cancel(); serialAxisWork = nil; serialDeferred = nil
-        try serial.send(value, sequence: sequence ?? nextSequence())
-        serialLast = value; serialLastSent = now
-        return true
+        }) { return true }
+        return false
     }
     private func flush() {
-        if serialLink {
-            guard active, serialReady, serial != nil else { return }
-            lock.lock(); let values = pending.drain(at: ProcessInfo.processInfo.systemUptime); lock.unlock()
-            for value in values {
-                guard active else { break }
-                latest = value
-                do { _ = try sendSerial(value) } catch { linkFail("케이블 쓰기 실패: \(error.localizedDescription)"); return }
-            }
-            return
-        }
-        guard active, let udp else { return }
+        guard active else { return }
         lock.lock(); let values = pending.drain(at: ProcessInfo.processInfo.systemUptime); lock.unlock()
         for value in values {
             guard active else { break }
             latest = value
-            let now = ProcessInfo.processInfo.systemUptime
-            let healthy = serial.map { Self.serialHealthy(openedAt: $0.openedAt, lastAck: $0.lastAck, now: now) } ?? false
-            let shared = nextSequence()
-            if serial != nil {
-                do {
-                    let sent = try sendSerial(value, sequence: healthy ? nil : shared)
-                    if healthy { continue }
-                    // When serial sends immediately, both paths share the same
-                    // sequence so late UDP cannot replay an older state.
-                    _ = sent
-                } catch {
-                    serialRetrySeconds = min(hidConnected ? 2 : 30, serialRetrySeconds * 2)
-                    lastSerialAttempt = ProcessInfo.processInfo.systemUptime
-                    dropSerial()
-                }
+            if serialLink {
+                if serialReady { sendSerial(value) }
+                continue
             }
-            do { try udp.send(value, sequence: shared) } catch { linkFail(error.localizedDescription) }
+            guard let udp else { continue }
+            let shared = nextSequence()
+            let healthy = serialOwned && Self.serialHealthy(openedAt: serialOpenedAt, lastAck: serialAck,
+                                                              now: ProcessInfo.processInfo.systemUptime)
+            let sent = serialOwned && sendSerial(value, sequence: shared)
+            if !healthy || !sent { do { try udp.send(value, sequence: shared) } catch { linkFail(error.localizedDescription) } }
         }
+        publishMetrics()
     }
     private func fail(_ message: String) {
         guard active else { return }
@@ -397,36 +421,41 @@ final class PiControlBridge: ControllerSession, @unchecked Sendable {
         guard active else { return }
         onMessage?("link-error", message); finish()
     }
-    private func finish() {
+    private func finish(_ completed: (() -> Void)? = nil) {
+        guard active else { completed?(); return }
         active = false; hidConnected = false
         let neutralSequence = nextSequence()
-        if serialLink {
-            if serialReady {
-                try? serial?.send(.neutral, sequence: neutralSequence)
-                try? serial?.sendControl(type: SerialControl.bye, body: SerialControl.byeBody(nonce: helloNonce))
-                serial?.drain(within: 0.2)
-            }
-        } else {
-            try? serial?.send(.neutral, sequence: neutralSequence)
-            try? udp?.send(ControllerInput.neutral, sequence: neutralSequence)
-        }
+        if !serialLink { try? udp?.send(.neutral, sequence: neutralSequence) }
+        let sendBye = serialLink && serialReady
+        let cableMode = serialLink
         serialReady = false; usbPending = nil
-        udp = nil; dropSerial(); serialTimer?.cancel(); serialTimer = nil; timer?.cancel(); timer = nil
+        if serialOwned {
+            serialOwned = false; serialOpening = false; generation &+= 1
+            serialLane.close(after: { serial in
+                if sendBye {
+                    try? serial.send(.neutral, sequence: neutralSequence)
+                    try? serial.sendControl(type: SerialControl.bye, body: SerialControl.byeBody(nonce: self.helloNonce))
+                    serial.drain()
+                } else if !cableMode {
+                    try? serial.send(.neutral, sequence: neutralSequence)
+                }
+            }, completion: { completed?() })
+        } else { completed?() }
+        serialMetrics = nil; serialAck = 0
+        udp = nil; serialTimer?.cancel(); serialTimer = nil; timer?.cancel(); timer = nil
         connection?.stateUpdateHandler = nil; connection?.cancel(); connection = nil
-        buffer = Data()
+        buffer = Data(); publishMetrics()
     }
     func stop() { queue.async { [self] in finish() } }
-    /// Writes the closing frames before returning (app termination). Never call from `queue`.
-    func stopNow() { queue.sync { [self] in finish() } }
-    /// Never call from `queue`.
+    /// Best effort for app termination; a stuck serial syscall cannot delay the caller indefinitely.
+    func stopNow() {
+        let done = DispatchSemaphore(value: 0)
+        queue.async { [self] in finish { done.signal() } }
+        _ = done.wait(timeout: .now() + 0.3)
+    }
     func transportMetrics() -> TransportMetrics? {
-        queue.sync {
-            guard active else { return nil }
-            if serialLink { return serial?.metrics }
-            if let serial, Self.serialHealthy(openedAt: serial.openedAt, lastAck: serial.lastAck, now: ProcessInfo.processInfo.systemUptime) { return serial.metrics }
-            if let udp { return udp.metrics }
-            return connection == nil ? nil : TransportMetrics(kind: "tls", rtt: nil)
-        }
+        lock.lock(); defer { lock.unlock() }
+        return cachedMetrics
     }
 }
 

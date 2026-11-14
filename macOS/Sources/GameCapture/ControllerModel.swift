@@ -52,6 +52,7 @@ import AgentControlProtocol
     private let serialProbe: () -> String?
     private var serialPath: String?
     private var serialProbeTimer: Timer?
+    private var serialProbeRunning = false
     /// Set after a link failure so the next attempt tries the other link.
     private var preferSerial = false
     private var viaSerial = false
@@ -83,7 +84,7 @@ import AgentControlProtocol
         self.serialGrace = serialGrace
         self.controllerProvider = controllerProvider
         self.serialProbe = serialProbe ?? (startDiscovery ? SerialControllerTransport.devicePath : { nil })
-        serialPath = self.serialProbe(); serialCable = serialPath != nil
+        updateSerialCable()
         positional = UserDefaults.standard.bool(forKey: "controller.positional")
         inputPipeline.setPositional(positional)
         status = "연결 안 됨"
@@ -152,8 +153,21 @@ import AgentControlProtocol
         reconnectIfPossible()
     }
     func updateSerialCable() {
+        guard !serialProbeRunning else { return }
+        serialProbeRunning = true
+        let probe = serialProbe
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let path = probe()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.serialProbeRunning = false
+                self.applySerialPath(path)
+            }
+        }
+    }
+    private func applySerialPath(_ path: String?) {
         let was = serialCable
-        serialPath = serialProbe()
+        serialPath = path
         if serialCable != (serialPath != nil) { serialCable = serialPath != nil }
         if !was && serialCable { reconnectIfPossible() }
     }
@@ -232,7 +246,6 @@ import AgentControlProtocol
         if pair { pairingRequested = true; if running { disconnect(manual: false) } }
         guard !running, let device = deviceStore.devices.first(where: { $0.id == selectedPi }) else { return }
         let endpoint = foundPis.first(where: { $0.id == selectedPi })
-        serialPath = serialProbe(); serialCable = serialPath != nil
         let useSerial = Self.chooseSerial(endpointFound: endpoint != nil, serialAvailable: serialPath != nil,
                                           preferSerial: preferSerial, pair: pairingRequested)
         // "Not on Bonjour" right after discovery starts usually means "not yet": wait before using the cable.
