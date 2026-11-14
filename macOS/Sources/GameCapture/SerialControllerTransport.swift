@@ -125,6 +125,7 @@ final class SerialControllerTransport {
     private var parser = SerialFrameParser()
     /// Called on the transport queue for each valid control frame.
     var onControl: ((UInt8, [UInt8]) -> Void)?
+    var onMetrics: ((TransportMetrics, Double) -> Void)?
     private var sentAt: [UInt64: Double] = [:]
     private(set) var lastAck = 0.0
     private(set) var rttSamples: [Double] = []
@@ -171,6 +172,9 @@ final class SerialControllerTransport {
         self.onFailure = onFailure
         let fd = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard ioctl(fd, TIOCEXCL) == 0 else {
+            let code = errno; close(fd); throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
         var options = termios()
         guard tcgetattr(fd, &options) == 0 else { let code = errno; close(fd); throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
         cfmakeraw(&options)
@@ -183,8 +187,16 @@ final class SerialControllerTransport {
         descriptor = fd
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.readAcks() }
-        source.setCancelHandler { close(fd) }
+        source.setCancelHandler { [weak self] in close(fd); self?.closeCompleted?(); self?.closeCompleted = nil }
         reader = source; source.resume()
+    }
+    private var closeCompleted: (() -> Void)?
+    func closeWhenCancelled(_ completion: @escaping () -> Void) {
+        guard let reader else { completion(); return }
+        closeCompleted = completion
+        self.reader = nil
+        descriptor = -1
+        reader.cancel()
     }
     func send(_ input: ControllerInput, sequence: UInt64) throws {
         guard descriptor >= 0, sequence > 0 else { throw POSIXError(.EBADF) }
@@ -200,13 +212,7 @@ final class SerialControllerTransport {
         let count = bytes.withUnsafeBytes { Darwin.write(descriptor, $0.baseAddress, $0.count) }
         guard count == bytes.count else { throw POSIXError(.EIO) }
     }
-    /// Waits up to `seconds` for written bytes to leave the adapter: closing a non-blocking tty
-    /// discards them. tcdrain alone would block forever if the other end stops reading.
-    func drain(within seconds: Double) {
-        let fd = descriptor, done = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async { _ = tcdrain(fd); done.signal() }
-        _ = done.wait(timeout: .now() + seconds)
-    }
+    func drain() { if descriptor >= 0 { _ = tcdrain(descriptor) } }
     private func readAcks() {
         var chunk = [UInt8](repeating: 0, count: 128)
         let n = Darwin.read(descriptor, &chunk, chunk.count)
@@ -226,6 +232,7 @@ final class SerialControllerTransport {
                                            maxMs: summary.max, windowEndUptime: now)
                 rttSamples.removeAll(keepingCapacity: true); lastRTTReset = now
             }
+            onMetrics?(metrics, lastAck)
         }
     }
     var metrics: TransportMetrics {
@@ -236,4 +243,106 @@ final class SerialControllerTransport {
         return TransportMetrics(kind: "serial", rtt: lastRTTWindow)
     }
     deinit { reader?.cancel() }
+}
+
+/// The only owner of a serial descriptor in this process. A close reservation is held until
+/// DispatchSource's cancellation handler has closed the descriptor.
+final class SerialLane: @unchecked Sendable {
+    static let shared = SerialLane()
+    private let queue = DispatchQueue(label: "net.tarucy.controller.serial", qos: .userInitiated)
+    private let lock = NSLock()
+    private let openTransport: (String, DispatchQueue, @escaping () -> Void) throws -> SerialControllerTransport
+    private var owner: UInt64 = 0
+    private var reserved = false
+    private var closing = false
+    private var busy = false
+    private var transport: SerialControllerTransport?
+
+    init(openTransport: @escaping (String, DispatchQueue, @escaping () -> Void) throws -> SerialControllerTransport =
+         { path, queue, failure in try SerialControllerTransport(path: path, queue: queue, onFailure: failure) }) {
+        self.openTransport = openTransport
+    }
+
+    func open(path: String?, lookup: Bool, on queueForReply: DispatchQueue,
+              result: @escaping (Result<(Double, TransportMetrics), Error>) -> Void,
+              failure: @escaping () -> Void, control: @escaping (UInt8, [UInt8]) -> Void,
+              metrics: @escaping (TransportMetrics, Double) -> Void) -> Bool {
+        lock.lock()
+        guard !reserved else { lock.unlock(); return false }
+        owner &+= 1
+        let token = owner
+        reserved = true; busy = true; closing = false
+        lock.unlock()
+        queue.async { [self] in
+            do {
+                guard let actualPath = lookup ? SerialControllerTransport.devicePath() : path else {
+                    throw POSIXError(.ENOENT)
+                }
+                let serial = try openTransport(actualPath, queue) {
+                    queueForReply.async(execute: failure)
+                }
+                serial.onControl = { type, body in queueForReply.async { control(type, body) } }
+                serial.onMetrics = { snapshot, ack in queueForReply.async { metrics(snapshot, ack) } }
+                transport = serial
+                let snapshot = (serial.openedAt, serial.metrics)
+                lock.lock(); busy = false; lock.unlock()
+                queueForReply.async { result(.success(snapshot)) }
+            } catch {
+                lock.lock()
+                if owner == token {
+                    busy = false
+                    if !closing { reserved = false }
+                }
+                lock.unlock()
+                queueForReply.async { result(.failure(error)) }
+            }
+        }
+        return true
+    }
+
+    /// Reject an operation while a previous syscall is in progress; never queue stale input.
+    func perform(_ operation: @escaping (SerialControllerTransport) throws -> Void,
+                 completion: @escaping (Error?) -> Void) -> Bool {
+        lock.lock()
+        guard reserved, !closing, !busy else { lock.unlock(); return false }
+        busy = true
+        let token = owner
+        lock.unlock()
+        queue.async { [self] in
+            let error: Error?
+            do {
+                lock.lock(); let valid = reserved && !closing && owner == token; lock.unlock()
+                guard valid else { throw POSIXError(.ECANCELED) }
+                guard let transport else { throw POSIXError(.EBADF) }
+                try operation(transport); error = nil
+            } catch let failure { error = failure }
+            lock.lock(); if owner == token { busy = false }; lock.unlock()
+            completion(error)
+        }
+        return true
+    }
+
+    func close(after operation: ((SerialControllerTransport) -> Void)? = nil,
+               completion: @escaping () -> Void = {}) {
+        lock.lock()
+        guard reserved, !closing else { lock.unlock(); completion(); return }
+        closing = true
+        let token = owner
+        lock.unlock()
+        queue.async { [self] in
+            guard let serial = transport else { release(token); completion(); return }
+            operation?(serial)
+            serial.closeWhenCancelled { [self] in
+                transport = nil
+                release(token)
+                completion()
+            }
+        }
+    }
+
+    private func release(_ token: UInt64) {
+        lock.lock()
+        if owner == token { reserved = false; busy = false; closing = false }
+        lock.unlock()
+    }
 }
