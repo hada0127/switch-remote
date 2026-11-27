@@ -6,6 +6,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) { MainActor.assumeIsolated { AgentControl.stop() } }
 }
 
+private final class FullScreenToolbarDelegate: NSObject, NSWindowDelegate {
+    let original: (any NSWindowDelegate)?
+
+    init(original: (any NSWindowDelegate)?) { self.original = original }
+
+    func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions) -> NSApplication.PresentationOptions {
+        proposedOptions.union(.autoHideToolbar)
+    }
+
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || (original?.responds(to: selector) ?? false)
+    }
+
+    override func forwardingTarget(for selector: Selector!) -> Any? {
+        original?.responds(to: selector) == true ? original : super.forwardingTarget(for: selector)
+    }
+}
+
+private struct CaptureWindowAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> CaptureWindowView { CaptureWindowView() }
+    func updateNSView(_ view: CaptureWindowView, context: Context) { view.attachDelegate() }
+}
+
+private final class CaptureWindowView: NSView {
+    private weak var installedWindow: NSWindow?
+    private var delegateProxy: FullScreenToolbarDelegate?
+
+    override func viewDidMoveToWindow() {
+        if let oldWindow = installedWindow, oldWindow.delegate === delegateProxy {
+            oldWindow.delegate = delegateProxy?.original
+        }
+        installedWindow = nil
+        delegateProxy = nil
+        attachDelegate()
+    }
+
+    func attachDelegate() {
+        guard let window, window.delegate !== delegateProxy else { return }
+        let proxy = FullScreenToolbarDelegate(original: window.delegate)
+        window.delegate = proxy
+        installedWindow = window
+        delegateProxy = proxy
+    }
+}
+
 @main struct GameCaptureApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var capture = CaptureModel()
@@ -15,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var body: some Scene {
         Window("switch-remote", id: "capture") {
             CaptureView(model: capture, controller: controller, settingsTab: $settingsTab).frame(minWidth: 560, minHeight: 460)
+                .background(CaptureWindowAccessor())
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
                         Button { capture.saveScreenshot() } label: { Image(systemName: "camera") }
